@@ -277,9 +277,9 @@ df0 = ensure_sorted(df0)
 idx = build_index(df0)
 for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participantes"]:
     if col in df0.columns:
-        idx[col] = df0.loc[idx.index, col].values
+        idx[col] = idx[col].values
         if f"__norm_{col}" in df0.columns:
-            idx[f"__norm_{col}"] = df0.loc[idx.index, f"__norm_{col}"].values
+            idx[f"__norm_{col}"] = idx[f"__norm_{col}"].values
 idx["__norm_part"] = idx["Participante_individual"].fillna("").astype(str).apply(_norm)
 
 # ----------------- Búsqueda tolerante (difflib) -----------------
@@ -322,7 +322,7 @@ if section == "Consulta":
     if aula_sel and aula_sel != "(todas)":
         mask &= idx["Aula"].fillna("").astype(str).eq(aula_sel)
     if solo_deleg:
-        mask &= (df0.loc[idx.index, "Requiere Delegación"]).values
+        mask &= idx["Requiere Delegación"] == True
     if term:
         mask &= (smart_match(idx["__norm_part"], term) |
                  smart_match(idx["__norm_Responsable"], term) |
