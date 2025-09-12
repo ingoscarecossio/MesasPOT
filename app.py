@@ -37,21 +37,22 @@ st.set_page_config(page_title="Buscador de Mesas", page_icon="🗂️", layout="
 # ----------------- Estilos y fondo -----------------
 _BG_B64 = globals().get("_BG_B64", None)
 
-def inject_base_css(dark: bool = True):
+
+def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     if _BG_B64:
         bg_url = f"data:image/png;base64,{_BG_B64}"
-        overlay = "linear-gradient(rgba(0,0,0,0.60), rgba(0,0,0,0.60))"
+        overlay = f"linear-gradient(rgba(0,0,0,{shade}), rgba(0,0,0,{shade}))"
         bg_css = f"background: {overlay}, url('{bg_url}') center center / cover fixed no-repeat;"
     else:
         bg_css = f"background: {'#0b1220' if dark else '#f7fafc'};"
-
+    row_pad = {"compacta":"0.25rem","media":"0.5rem","amplia":"0.8rem"}[density]
     st.markdown(f"""
     <style>
     .stApp {{
         {bg_css}
         color: {"#e5e7eb" if dark else "#111827"} !important;
     }}
-    .block-container {{ padding-top: 1.2rem; backdrop-filter: saturate(1.1); }}
+    .block-container {{ padding-top: 1.0rem; backdrop-filter: saturate(1.1); }}
     .gradient-title {{
         background: linear-gradient(90deg, #60a5fa 0%, #22d3ee 100%);
         -webkit-background-clip: text;
@@ -61,30 +62,34 @@ def inject_base_css(dark: bool = True):
     .card {{
         border-radius: 16px; padding: 1rem 1.2rem; 
         border: 1px solid {("#1f2937" if dark else "#e5e7eb")};
-        background: {"rgba(17,24,39,0.75)" if dark else "rgba(255,255,255,0.85)"};
+        background: {"rgba(17,24,39,0.82)" if dark else "rgba(255,255,255,0.93)"};
         box-shadow: 0 10px 30px rgba(0,0,0,0.25);
     }}
     .kpi {{ font-size: .9rem; color: {"#cbd5e1" if dark else "#6b7280"}; margin-bottom: .25rem; }}
     .kpi .value {{ display:block; font-size:1.6rem; font-weight:700; color: {"#f8fafc" if dark else "#111827"}; }}
     .small {{ font-size: .85rem; color: {"#cbd5e1" if dark else "#6b7280"}; }}
+    .stDataFrame div[role='row'] {{ padding-top: {row_pad}; padding-bottom: {row_pad}; }}
     .dataframe th, .dataframe td {{ background: transparent !important; }}
     </style>
     """, unsafe_allow_html=True)
-
 # ----------------- Modo oscuro por defecto -----------------
 if "dark" not in st.session_state:
     st.session_state.dark = True
 
 with st.sidebar:
     st.session_state.dark = st.checkbox("Modo oscuro", value=st.session_state.dark)
-    section = st.radio("Sección", ["Consulta", "Agenda", "Gantt", "Heatmap", "Conflictos", "Delegaciones", "Acerca de"], index=0)
+    section = st.radio("Sección", ["Resumen","Consulta", "Agenda", "Gantt", "Heatmap", "Conflictos", "Delegaciones", "Acerca de"], index=0)
     use_local = st.checkbox("Usar archivo local (sobrescribir embebido)", value=False)
     local_path = st.text_input("Ruta local (opcional)", value="./STREAMLIT.xlsx", help="Si está activo 'Usar archivo local', intentaré cargar este archivo.")
 
-inject_base_css(st.session_state.dark)
+    ui_dark = st.slider("Intensidad del fondo", 0.0, 1.0, 0.75, 0.05, help="Oscurece la imagen para mejorar el contraste")
+    densidad = st.select_slider("Densidad de tabla", options=["compacta","media","amplia"], value="compacta")
 
-st.markdown("<h1 class='gradient-title'>🗂️ Buscador de Mesas</h1>", unsafe_allow_html=True)
-st.caption("Excel embebido, búsqueda tolerante (difflib), agenda, heatmap, delegaciones, ICS/CSV/Excel, Gantt y conflictos.")
+
+inject_base_css(st.session_state.dark, ui_dark if 'ui_dark' in locals() else 0.75, densidad if 'densidad' in locals() else 'compacta')
+
+st.markdown("<h1 class='gradient-title'>🗂️ Buscador de Mesas · PRO</h1>", unsafe_allow_html=True)
+st.caption("Vista PRO: alto contraste, filtros avanzados, resumen ejecutivo, ICS por persona y por aula.")
 
 # ----------------- Utilidades de datos -----------------
 _SEP_REGEX = re.compile(r"[;,/]|\n|\r|\t|\||\u2022|·")
@@ -322,8 +327,84 @@ def smart_match(series_norm: pd.Series, query: str, threshold: int = 80):
     return series_norm.apply(lambda s: _score(s, q) >= threshold)
 
 # ----------------- UI -----------------
-if section == "Consulta":
+
+if section == "Resumen":
+    st.subheader("📈 Resumen ejecutivo")
+    # KPIs globales
+    tm, na, nd, np = make_stats(df0)
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: st.markdown(f"<div class='card'><div class='kpi'>Mesas</div><span class='value'>{tm}</span></div>", unsafe_allow_html=True)
+    with c2: st.markdown(f"<div class='card'><div class='kpi'>Aulas</div><span class='value'>{na}</span></div>", unsafe_allow_html=True)
+    with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
+    with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{np}</span></div>", unsafe_allow_html=True)
+
+    # Top 10 personas por participación (conteo de mesas donde aparece)
+    all_people = []
+    for v in df0["Participantes"].fillna("").astype(str).tolist():
+        all_people += _split_people(v)
+    all_people += df0["Responsable"].dropna().astype(str).tolist()
+    all_people += df0["Corresponsable"].dropna().astype(str).tolist()
+    s = pd.Series([p.strip() for p in all_people if p and str(p).strip()])
+    top_people = s.value_counts().head(10).rename_axis("Persona").reset_index(name="Conteo")
+
+    # Uso por aula
+    uso_aula = df0.groupby("Aula")["Mesa"].count().sort_values(ascending=False).head(10).rename_axis("Aula").reset_index(name="Mesas")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top 10 personas por participación**")
+        if not top_people.empty:
+            import plotly.express as px
+            st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
+        else:
+            st.info("Sin datos de personas.")
+    with c2:
+        st.markdown("**Aulas más usadas (Top 10)**")
+        if not uso_aula.empty:
+            import plotly.express as px
+            st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
+        else:
+            st.info("Sin datos de aulas.")
+
+    # Distribución por día de semana y horas pico
+    dfh = df0.copy()
+    dfh["_fecha"] = dfh["Fecha"].apply(_to_date)
+    dfh["_ini"] = dfh["Inicio"].apply(_to_time)
+    dfh = dfh.dropna(subset=["_fecha"])
+    dfh["Día semana"] = dfh["_fecha"].apply(lambda d: ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"][d.weekday()] if d else None)
+    by_dow = dfh.groupby("Día semana")["Mesa"].count().reindex(["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]).fillna(0).reset_index(name="Mesas")
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Mesas por día de la semana**")
+        st.plotly_chart(px.bar(by_dow, x="Día semana", y="Mesas", height=300), use_container_width=True)
+    with c4:
+        st.markdown("**Horas de inicio (histograma)**")
+        hh = [t.hour for t in dfh["_ini"] if t is not None]
+        if hh:
+            st.plotly_chart(px.histogram(pd.DataFrame({"Hora": hh}), x="Hora", nbins=12, height=300), use_container_width=True)
+        else:
+            st.info("Sin horas de inicio válidas.")
+
+elif section == "Consulta":
     with st.expander("⚙️ Filtros", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        fechas_validas = [d for d in df0["Fecha"].apply(_to_date).dropna().tolist()]
+        if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
+        else:
+            today = date.today(); dmin, dmax = today, today
+        with c1:
+            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+            fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
+            horas = st.slider("Rango de horas", 0, 23, (6, 20))
+        with c2:
+            aulas = sorted(df0["Aula"].dropna().astype(str).unique().tolist())
+            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"])
+            dow = st.multiselect("Días semana", ["Lun","Mar","Mié","Jue","Vie"], default=["Lun","Mar","Mié","Jue","Vie"])
+        with c3:
+            responsables = sorted(df0["Responsable"].dropna().astype(str).unique().tolist())
+            rsel = st.multiselect("Responsables", responsables)
+            solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación", value=False)
+
         c1, c2, c3 = st.columns(3)
         fechas_validas = [d for d in df0["Fecha"].apply(_to_date).dropna().tolist()]
         if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
@@ -347,8 +428,25 @@ if section == "Consulta":
     mask = pd.Series([True]*len(idx))
     fvals = idx["Fecha"].apply(_to_date)
     mask &= fvals.apply(lambda d: (d is not None) and (fmin <= d <= fmax))
-    if aula_sel and aula_sel != "(todas)":
-        mask &= idx["Aula"].fillna("").astype(str).eq(aula_sel)
+    # Aulas
+    if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
+        allowed = set([a for a in aula_sel if a != "(todas)"])
+        mask &= idx["Aula"].fillna("").astype(str).isin(allowed)
+
+    # Día de semana
+    dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4,"Sáb":5,"Dom":6}
+    mask &= idx["Fecha"].apply(lambda d: _to_date(d) is not None and dows[["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"][_to_date(d).weekday()]] in [dows[x] for x in dow])
+
+    # Horas
+    hmin, hmax = horas
+    def _hour_ok(v):
+        t = _to_time(v)
+        return (t is not None) and (hmin <= t.hour <= hmax)
+    mask &= idx["Inicio"].apply(_hour_ok)
+
+    # Responsables
+    if rsel:
+        mask &= idx["Responsable"].fillna("").astype(str).isin(set(rsel))
     if solo_deleg:
         mask &= idx["Requiere Delegación"] == True
     if term:
@@ -392,6 +490,22 @@ if section == "Consulta":
         calname = f"Mesas — {term}" if term else "Mesas"
         st.download_button("ICS (todo en uno)", data=build_ics(rf, calendar_name=calname), mime="text/calendar", file_name="mesas.ics")
         st.download_button("ICS por mesa (ZIP)", data=zip_split_ics(rf), mime="application/zip", file_name="mesas_por_mesa.zip")
+
+        st.markdown("#### 🔎 Detalle rápido")
+        opciones = rf["Nombre de la mesa"].astype(str).unique().tolist()
+        mesa_sel = st.selectbox("Seleccione una mesa", ["(ninguna)"] + opciones, index=0)
+        if mesa_sel != "(ninguna)":
+            detalle = df0[df0["Nombre de la mesa"].astype(str)==mesa_sel].head(1).to_dict(orient="records")[0]
+            st.markdown(f"""
+            <div class='card'>
+            <b>{detalle.get('Nombre de la mesa','')}</b><br>
+            <span class='small'>Objetivo:</span> {detalle.get('Objetivo General ','')}<br>
+            <span class='small'>Estrategia:</span> {detalle.get('Propuesta de Objetivos Estrategicos a abordar','')}<br>
+            <span class='small'>Aula:</span> {detalle.get('Aula','')} · <span class='small'>Fecha:</span> {detalle.get('Fecha','')} · <span class='small'>Hora:</span> {detalle.get('Inicio','')}–{detalle.get('Fin','')}<br>
+            <span class='small'>Resp.:</span> {detalle.get('Responsable','')} · <span class='small'>Co-resp.:</span> {detalle.get('Corresponsable','')}
+            </div>
+            """, unsafe_allow_html=True)
+
 
 elif section == "Agenda":
     st.subheader("🗓️ Agenda por persona")
