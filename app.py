@@ -636,4 +636,4 @@ elif section == "Delegaciones":
 
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Excel y fondo embebidos; búsqueda difusa, resumen ejecutivo, ICS por persona y aula, heatmap, Gantt, conflictos y delegaciones.")
+    st.markdown("Fecha de publicacion 12/09/2025")
