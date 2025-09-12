@@ -347,7 +347,7 @@ if section == "Consulta":
     mask = pd.Series([True]*len(idx))
     fvals = idx["Fecha"].apply(_to_date)
     mask &= fvals.apply(lambda d: (d is not None) and (fmin <= d <= fmax))
-    if aula_sel and aula_sel != "(todas)"):
+    if aula_sel and aula_sel != "(todas)":
         mask &= idx["Aula"].fillna("").astype(str).eq(aula_sel)
     if solo_deleg:
         mask &= idx["Requiere Delegación"] == True
