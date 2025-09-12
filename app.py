@@ -25,7 +25,7 @@ try:
 except Exception:
     TZ = timezone(timedelta(hours=-5))
 
-st.set_page_config(page_title="Buscador de Mesas · PRO", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Buscador de Mesas · EN - CLAVE", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
 
 # --- Keys namespace ---
 def _keyns(section_name: str, base: str) -> str:
@@ -80,7 +80,7 @@ with st.sidebar:
 
 inject_base_css(st.session_state.dark, ui_dark, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Buscador de Mesas · PRO</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='gradient-title'>🗂️ Buscador de Mesas · EN - CLAVE</h1>", unsafe_allow_html=True)
 st.caption("Alto contraste, filtros avanzados, resumen ejecutivo, ICS por persona y por aula.")
 
 # --- Datos & utilidades ---
