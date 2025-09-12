@@ -393,17 +393,17 @@ elif section == "Consulta":
         else:
             today = date.today(); dmin, dmax = today, today
         with c1:
-            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="filtro_fechas")
             fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
-            horas = st.slider("Rango de horas", 0, 23, (6, 20))
+            horas = st.slider("Rango de horas", 0, 23, (6, 20), key="filtro_horas")
         with c2:
             aulas = sorted(df0["Aula"].dropna().astype(str).unique().tolist())
-            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"])
-            dow = st.multiselect("Días semana", ["Lun","Mar","Mié","Jue","Vie"], default=["Lun","Mar","Mié","Jue","Vie"])
+            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"], key="filtro_aulas")
+            dow = st.multiselect("Días semana", ["Lun","Mar","Mié","Jue","Vie"], default=["Lun","Mar","Mié","Jue","Vie"], key="filtro_dow")
         with c3:
             responsables = sorted(df0["Responsable"].dropna().astype(str).unique().tolist())
-            rsel = st.multiselect("Responsables", responsables)
-            solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación", value=False)
+            rsel = st.multiselect("Responsables", responsables, key="filtro_resp")
+            solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación", value=False, key="filtro_deleg")
 
         c1, c2, c3 = st.columns(3)
         fechas_validas = [d for d in df0["Fecha"].apply(_to_date).dropna().tolist()]
@@ -411,19 +411,19 @@ elif section == "Consulta":
         else:
             today = date.today(); dmin, dmax = today, today
         with c1:
-            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="filtro_fechas")
             fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
         with c2:
             aulas = ["(todas)"] + sorted(df0["Aula"].dropna().astype(str).unique().tolist())
             aula_sel = st.selectbox("Aula", aulas, index=0)
         with c3:
-            solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación", value=False)
+            solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación", value=False, key="filtro_deleg")
 
-    modo = st.radio("Búsqueda", ["Seleccionar", "Texto"], index=0, horizontal=True)
+    modo = st.radio("Búsqueda", ["Seleccionar", "Texto"], index=0, horizontal=True, key="modo_busqueda")
     people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                     + df0["Responsable"].dropna().astype(str).tolist()
                                     + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
-    term = st.selectbox("Participante", options=[""]+people, index=0) if modo=="Seleccionar" else st.text_input("Escriba parte del nombre")
+    term = st.selectbox("Participante", options=[""]+people, index=0, key="sel_participante") if modo=="Seleccionar" else st.text_input("Escriba parte del nombre", key="term_texto")
 
     mask = pd.Series([True]*len(idx))
     fvals = idx["Fecha"].apply(_to_date)
@@ -493,7 +493,7 @@ elif section == "Consulta":
 
         st.markdown("#### 🔎 Detalle rápido")
         opciones = rf["Nombre de la mesa"].astype(str).unique().tolist()
-        mesa_sel = st.selectbox("Seleccione una mesa", ["(ninguna)"] + opciones, index=0)
+        mesa_sel = st.selectbox("Seleccione una mesa", ["(ninguna)"] + opciones, index=0, key="detalle_mesa")
         if mesa_sel != "(ninguna)":
             detalle = df0[df0["Nombre de la mesa"].astype(str)==mesa_sel].head(1).to_dict(orient="records")[0]
             st.markdown(f"""
@@ -512,7 +512,7 @@ elif section == "Agenda":
     people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                     + df0["Responsable"].dropna().astype(str).tolist()
                                     + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
-    persona = st.selectbox("Seleccione persona", options=people)
+    persona = st.selectbox("Seleccione persona", options=people, key="agenda_persona")
     if persona:
         m = (smart_match(idx["__norm_part"], persona, 90) |
              smart_match(idx["__norm_Responsable"], persona, 90) |
@@ -565,7 +565,7 @@ elif section == "Conflictos":
     people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                     + df0["Responsable"].dropna().astype(str).tolist()
                                     + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
-    psel = st.multiselect("Personas a auditar", options=people)
+    psel = st.multiselect("Personas a auditar", options=people, key="conf_personas")
     if not psel:
         st.info("Seleccione una o más personas.")
     else:
