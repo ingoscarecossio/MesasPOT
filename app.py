@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Buscador de Mesas — ULTRA PRO MAX (GitHub-ready, standalone builder)
-- Delegaciones 2.0 (exact + token + rango horario si está disponible)
-- Conflictos por persona y por aula, con “brecha mínima” configurable
-- Buscador de disponibilidad (personas/aulas) y exportadores ICS/CSV/ZIP
-- Diagnóstico + Auditoría de esquema y normalización de nombres
-- Estado compartible por URL (query params)
-- Sin dependencias nuevas (difflib; sin rapidfuzz)
+Mesas · INIMAGINABLE (GitHub-ready, standalone builder)
+- Omnibox + deep-link por URL
+- Perfiles (admin/coord/lectura) con modo auditoría (delegaciones siempre activas en lectura)
+- Delegaciones 2.0 (día/rango horario) + Aliases opcional (hoja "Aliases")
+- Conflictos avanzados (personas/aulas) con brecha mínima + micro-timeline visual
+- Disponibilidad (personas/aulas) con export CSV
+- Exportadores CSV/Excel/ICS/ZIP + PDF nativo (o HTML imprimible si no hay reportlab)
+- Diagnóstico con auditoría estricta y generador de app embebida + paquete ZIP
 """
-import io, re, uuid, zipfile, base64, unicodedata, difflib, os, textwrap, inspect, sys, json
+import io, re, uuid, zipfile, base64, unicodedata, difflib, os, inspect, sys, json
 from datetime import datetime, date, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -16,27 +17,26 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# ========== EMBEBIDOS (opcional) ==========
+# ========= Embebidos opcionales =========
 _EMBED_XLSX_B64 = ""        # STREAMLIT.xlsx (hoja “Calendario” o primera)
-_EMBED_DELEG_B64 = ""       # DELEGACIONES.xlsx (Sheet1/primera)
-_BG_B64 = ""                # Fondo opcional en Base64
+_EMBED_DELEG_B64 = ""       # DELEGACIONES.xlsx (primera hoja)
+_BG_B64 = ""                # Fondo opcional (base64)
 _SHEET_CANDIDATES = ["Calendario", "Agenda", "Programación"]
 
-# ========== CONFIG ==========
+# ========= Config & rutas repo =========
 _DELEG_MARKER_REGEX = re.compile(r"\(\s*no disponible\s*,\s*asignar delegado\s*\)", re.IGNORECASE)
 _SEP_REGEX = re.compile(r"[;,/]|\n|\r|\t|\||\u2022|·")
 REPO_CAND_MAIN = ["STREAMLIT.xlsx","./data/STREAMLIT.xlsx","/mnt/data/STREAMLIT.xlsx"]
 REPO_CAND_DELEG = ["DELEGACIONES.xlsx","./data/DELEGACIONES.xlsx","/mnt/data/DELEGACIONES.xlsx"]
 
-# Zona horaria por defecto (configurable en “Diagnóstico”)
 try:
     from zoneinfo import ZoneInfo
     TZ_DEFAULT = ZoneInfo("America/Bogota")
 except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
-# ========== UI ==========
-st.set_page_config(page_title="Mesas · ULTRA PRO MAX", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
+# ========= UI base =========
+st.set_page_config(page_title="Mesas · INIMAGINABLE", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
 
 def _keyns(section_name: str, base: str) -> str:
     safe = section_name.replace(" ", "_").lower() if isinstance(section_name, str) else "app"
@@ -77,7 +77,7 @@ def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "comp
     </style>
     """, unsafe_allow_html=True)
 
-# ========== NORMALIZACIÓN ==========
+# ========= Normalización =========
 COLUMN_ALIASES = {
     "Mesa": ["Mesa", "N° Mesa", "No Mesa", "Numero Mesa", "Número Mesa"],
     "Nombre de la mesa": ["Nombre de la mesa", "Nombre mesa", "Mesa - Nombre", "Titulo Mesa", "Título Mesa"],
@@ -153,7 +153,7 @@ def combine_dt(fecha, hora, tz: Optional[timezone]=None):
     try: return dt.replace(tzinfo=tz)
     except Exception: return dt
 
-def ensure_sorted(df: pd.DataFrame):
+def ensure_sorted(df):
     df = df.copy()
     if "Fecha" in df.columns and "Inicio" in df.columns:
         df["_Fecha_dt"] = df["Fecha"].apply(_to_date)
@@ -162,7 +162,7 @@ def ensure_sorted(df: pd.DataFrame):
         df.drop(columns=["_Fecha_dt","_Inicio_t"], inplace=True)
     return df
 
-# ========== CARGA ==========
+# ========= Carga de datos =========
 def _read_excel_from_bytes(data: bytes, sheet_candidates=None) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(data))
     sheet = None
@@ -199,14 +199,14 @@ def _try_load_deleg(embed_b64: str):
             return pd.ExcelFile(path).parse(0)
     return pd.DataFrame()
 
-# ========== Query Params (estado compartible) ==========
+# ========= Query params (estado compartible) =========
 def set_qp(**kwargs):
     qp = st.query_params
     for k,v in kwargs.items():
-        if v is None: 
+        if v is None:
             if k in qp: del qp[k]
         else:
-            qp[k] = json.dumps(v) if isinstance(v,(list,tuple,dict)) else str(v)
+            qp[k] = json.dumps(v, ensure_ascii=False) if isinstance(v,(list,tuple,dict)) else str(v)
 
 def get_qp(key, default=None, parse_json=False):
     qp = st.query_params
@@ -217,14 +217,29 @@ def get_qp(key, default=None, parse_json=False):
         except Exception: return default
     return val
 
-# ========== Sidebar ==========
+def snapshot_state_export():
+    data = dict(st.query_params)
+    blob = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button("⬇️ Snapshot (.json)", data=blob, mime="application/json", file_name="snapshot_mesas.json")
+
+def snapshot_state_import():
+    up = st.file_uploader("Cargar snapshot (.json)", type=["json"], key="snapup")
+    if up is not None:
+        try:
+            js = json.load(up)
+            st.query_params.clear()
+            for k,v in js.items(): st.query_params[k] = v
+            st.success("Snapshot cargado. Refrescando…"); st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo cargar el snapshot: {e}")
+
+# ========= Sidebar =========
 if "dark" not in st.session_state: st.session_state.dark = True
 with st.sidebar:
     st.session_state.dark = st.checkbox("Modo oscuro", value=st.session_state.dark)
     section = st.radio("Sección", ["Resumen","Consulta","Agenda","Gantt","Heatmap","Conflictos","Disponibilidad","Delegaciones","Diagnóstico","Acerca de"], index=0)
     ui_dark = st.slider("Intensidad fondo", 0.0, 1.0, float(get_qp("shade",0.75)), 0.05)
     densidad = st.select_slider("Densidad tabla", options=["compacta","media","amplia"], value=get_qp("dens","compacta"))
-    # Persistir estado en URL
     set_qp(shade=ui_dark, dens=densidad, sec=section)
 
     st.markdown("### 📦 Datos")
@@ -232,19 +247,29 @@ with st.sidebar:
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
 
 inject_base_css(st.session_state.dark, ui_dark, densidad)
-st.markdown("<h1 class='gradient-title'>🗂️ Mesas · ULTRA PRO MAX</h1>", unsafe_allow_html=True)
-st.caption("Delegaciones 2.0 • Conflictos avanzados • Disponibilidad • URL compartible • Exportadores ICS/CSV/ZIP")
 
-# ========== Lectura ==========
+st.markdown("<h1 class='gradient-title'>🗂️ Mesas · INIMAGINABLE</h1>", unsafe_allow_html=True)
+st.caption("Omnibox • Perfiles • Delegaciones 2.0 • Conflictos avanzados • Disponibilidad • Exportadores completos")
+
+# ========= Perfiles & auditoría =========
+PROFILE = st.query_params.get("profile","lectura").lower()   # admin | coord | lectura
+IS_ADMIN = PROFILE == "admin"
+IS_COORD = PROFILE == "coord"
+READONLY = PROFILE == "lectura"
+
+def badge_profile():
+    color = {"admin":"💎","coord":"🧭","lectura":"🔒"}.get(PROFILE,"🔒")
+    st.markdown(f"<div class='small'>Perfil activo: <b>{PROFILE}</b> {color}</div>", unsafe_allow_html=True)
+badge_profile()
+
+# ========= Lectura principal =========
 raw = _try_load_main(_EMBED_XLSX_B64)
 df0 = normalize_cols(raw)
 
-# Aliases (opcional): hoja “Aliases” con columnas Person_old, Person_new, Aula_old, Aula_new
+# Aliases opcionales (hoja "Aliases")
 aliases_map = {}
 try:
-    # Buscar hoja “Aliases” si el archivo embebido/archivo repo lo tiene
     def _read_aliases():
-        # encontrar fuente efectiva
         if _EMBED_XLSX_B64:
             rawb = base64.b64decode(_EMBED_XLSX_B64.encode("utf-8"))
             xls = pd.ExcelFile(io.BytesIO(rawb))
@@ -269,7 +294,12 @@ try:
 except Exception:
     aliases_map = {}
 
-# Limpiar marcador de delegación en texto
+def _apply_alias(s: str, kind: str):
+    m = aliases_map.get(kind, {})
+    n = _norm(s)
+    return next((v for k,v in m.items() if k == n), n)
+
+# Quitar marcadores de delegación en texto
 def add_delegate_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ["Participantes", "Responsable", "Corresponsable"]:
@@ -282,23 +312,13 @@ def add_delegate_flags(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 df0 = add_delegate_flags(df0)
-
-# Normalizaciones básicas + aliases
-def _apply_alias(s: str, kind: str):
-    m = aliases_map.get(kind, {})
-    n = _norm(s)
-    return next((v for k,v in m.items() if k == n), n)
-
 for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la mesa","Mesa"]:
-    if col in df0.columns: 
-        df0[f"__norm_{col}"] = df0[col].fillna("").astype(str).apply(_norm)
-
+    if col in df0.columns: df0[f"__norm_{col}"] = df0[col].fillna("").astype(str).apply(_norm)
 if "Aula" in df0.columns:
     df0["__norm_Aula"] = df0["Aula"].astype(str).map(lambda x:_apply_alias(x,"aula"))
-
 df0 = ensure_sorted(df0)
 
-# Expandir índice por persona (incluye responsables)
+# Expandir índice por persona (incluye responsables/corresponsables)
 def _split_people(cell):
     if pd.isna(cell): return []
     parts = _SEP_REGEX.split(str(cell))
@@ -331,7 +351,7 @@ for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participa
 idx["__norm_Aula"] = idx.get("Aula","").astype(str).map(lambda x:_apply_alias(x,"aula"))
 idx["__norm_part"] = idx["Participante_individual"].fillna("").astype(str).apply(lambda s:_apply_alias(s,"person"))
 
-# ========== Delegaciones (2.0) ==========
+# ========= Delegaciones 2.0 =========
 deleg_raw = _try_load_deleg(_EMBED_DELEG_B64)
 
 def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
@@ -347,26 +367,24 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         if col_fin   is None and (cl=="fin" or "hora fin" in cl or "fin" in cl): col_fin = c
     if col_actor is None or col_mesa is None or col_fecha is None:
         return pd.DataFrame(columns=["__actor","__mesa","__fecha","__ini","__fin"])
+    def _to_t(x):
+        d = pd.to_datetime(x, errors="coerce")
+        if not pd.isna(d) and isinstance(d, pd.Timestamp): return d.time().replace(microsecond=0)
+        try:
+            s = str(x).strip()
+            if not s: return None
+            hh,mm = s.split(":")[:2]
+            return time(int(hh), int(mm))
+        except Exception:
+            return None
     out = pd.DataFrame({
         "__actor": df[col_actor].astype(str).map(lambda s:_apply_alias(s,"person")),
         "__mesa":  df[col_mesa].astype(str).map(_norm),
-        "__fecha": pd.to_datetime(df[col_fecha], errors="coerce").dt.date
+        "__fecha": pd.to_datetime(df[col_fecha], errors="coerce").dt.date,
+        "__ini": df[col_ini].map(_to_t) if col_ini in df.columns else None,
+        "__fin": df[col_fin].map(_to_t) if col_fin in df.columns else None
     }).dropna(subset=["__mesa","__fecha"])
     out = out[out["__actor"].astype(bool)]
-    # Si hay horas, conservarlas
-    def _to_t(x):
-        d = pd.to_datetime(x, errors="coerce")
-        if pd.isna(d): 
-            try:
-                s = str(x).strip()
-                if not s: return None
-                hh,mm = s.split(":")[:2]
-                return time(int(hh), int(mm))
-            except Exception:
-                return None
-        return d.time().replace(microsecond=0)
-    out["__ini"] = df[col_ini].map(_to_t) if col_ini in df.columns else None
-    out["__fin"] = df[col_fin].map(_to_t) if col_fin in df.columns else None
     return out
 
 deleg_map = _prepare_deleg_map(deleg_raw)
@@ -390,7 +408,6 @@ def annotate_delegations(idx: pd.DataFrame, dmap: pd.DataFrame) -> pd.DataFrame:
         key = (r.get("__norm_Mesa",""), _to_date(r.get("Fecha")))
         candidates = groups.get(key, [])
         actor = r.get("__norm_part","")
-        # si hay horas en dmap, exigir solape horario; si no, el día completo se considera delegado
         ini_r, fin_r = _to_time(r.get("Inicio")), _to_time(r.get("Fin"))
         ok_any = False
         for cand_actor, ini_d, fin_d in candidates:
@@ -408,7 +425,7 @@ idx = annotate_delegations(idx, deleg_map)
 
 def mark_event_delegations(df: pd.DataFrame, idx: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    if idx.empty: 
+    if idx.empty:
         df["Delegado por lista"] = False
         return df
     delegated_events = set((r["__norm_Mesa"], _to_date(r["Fecha"])) for _, r in idx[idx["__delegado_por_archivo"]==True].iterrows())
@@ -418,7 +435,7 @@ def mark_event_delegations(df: pd.DataFrame, idx: pd.DataFrame) -> pd.DataFrame:
 
 df0 = mark_event_delegations(df0, idx)
 
-# ========== Fuzzy ==========
+# ========= Fuzzy =========
 def _score(a: str, b: str) -> float:
     a = _norm(a); b = _norm(b)
     if not a or not b: return 0.0
@@ -429,7 +446,7 @@ def smart_match(series_norm: pd.Series, query: str, threshold: int = 80):
     if not q: return pd.Series([True]*len(series_norm), index=series_norm.index)
     return series_norm.apply(lambda s: _score(s, q) >= threshold)
 
-# ========== Helpers ICS/ZIP ==========
+# ========= ICS / ZIP / PDF =========
 def escape_text(val: str) -> str:
     return val.replace("\\","\\\\").replace(";","\\;").replace(",","\\,").replace("\\n","\\n").replace("\\r","\\r")
 
@@ -493,12 +510,69 @@ def zip_split_ics(rows: pd.DataFrame):
     mem.seek(0)
     return mem.getvalue()
 
-# ========== Secciones ==========
+def _has_reportlab():
+    try:
+        import reportlab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+def export_pdf_simple(title: str, rows: pd.DataFrame, filename: str="reporte.pdf"):
+    if rows is None or rows.empty:
+        st.info("No hay datos para exportar.")
+        return
+    if not _has_reportlab():
+        html = "<h2>"+title+"</h2>" + rows.to_html(index=False)
+        st.download_button("⬇️ HTML (imprimir a PDF)", data=html.encode("utf-8"), mime="text/html", file_name=filename.replace(".pdf",".html"))
+        st.info("Instala 'reportlab' para PDF nativo: `pip install reportlab`")
+        return
+    from reportlab.lib.pagesizes import A4  # type: ignore
+    from reportlab.pdfgen import canvas    # type: ignore
+    from reportlab.lib.units import cm     # type: ignore
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    y = H - 2*cm
+    c.setFont("Helvetica-Bold", 14); c.drawString(2*cm, y, title); y -= 1*cm
+    c.setFont("Helvetica", 8)
+    cols = list(rows.columns)
+    colw = (W-4*cm)/max(len(cols),1)
+    c.setFont("Helvetica-Bold", 8)
+    for i, h in enumerate(cols): c.drawString(2*cm+i*colw, y, str(h)[:22])
+    y -= 0.6*cm
+    c.setFont("Helvetica", 8)
+    for _, r in rows.iterrows():
+        for i, k in enumerate(cols):
+            c.drawString(2*cm+i*colw, y, str(r.get(k,""))[:22])
+        y -= 0.48*cm
+        if y < 2*cm:
+            c.showPage(); y = H - 2*cm; c.setFont("Helvetica", 8)
+            c.setFont("Helvetica-Bold", 8)
+            for i, h in enumerate(cols): c.drawString(2*cm+i*colw, y, str(h)[:22])
+            y -= 0.6*cm
+            c.setFont("Helvetica", 8)
+    c.save(); buf.seek(0)
+    st.download_button("⬇️ PDF", data=buf.getvalue(), mime="application/pdf", file_name=filename)
+
+# ========= Omnibox (deep-link a Consulta) =========
+c_omni = st.text_input("🔎 Búsqueda rápida (persona / mesa / aula)", value=st.query_params.get("q",""))
+if c_omni:
+    qn = _norm(c_omni)
+    aulas_known = sorted(df0["Aula"].dropna().astype(str).unique().tolist())
+    if any(_norm(a)==qn for a in aulas_known):
+        st.query_params["sec"] = "Consulta"
+        st.query_params["aulas"] = json.dumps([next(a for a in aulas_known if _norm(a)==qn)])
+    else:
+        st.query_params["sec"] = "Consulta"
+        st.query_params["q"] = c_omni
+    st.rerun()
+
 st.divider()
 
+# ========= Secciones =========
 if section == "Resumen":
     st.subheader("📈 Resumen ejecutivo")
-    def make_stats(df: pd.DataFrame):
+    def make_stats(df):
         n_mesas = df.shape[0]
         aulas = df["Aula"].dropna().astype(str).nunique() if "Aula" in df else 0
         dias = df["Fecha"].apply(_to_date).dropna().nunique() if "Fecha" in df else 0
@@ -516,7 +590,7 @@ if section == "Resumen":
     with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
     with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{np}</span></div>", unsafe_allow_html=True)
 
-    # Top
+    # Tops
     all_people = []
     for v in df0["Participantes"].fillna("").astype(str).tolist(): all_people += _split_people(v)
     all_people += df0["Responsable"].dropna().astype(str).tolist()
@@ -526,12 +600,8 @@ if section == "Resumen":
     uso_aula = df0.groupby("Aula")["Mesa"].count().sort_values(ascending=False).head(10).rename_axis("Aula").reset_index(name="Mesas")
 
     c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Top 10 personas por participación**")
-        st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
-    with c2:
-        st.markdown("**Aulas más usadas (Top 10)**")
-        st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
+    with c1: st.markdown("**Top 10 personas por participación**"); st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
+    with c2: st.markdown("**Aulas más usadas (Top 10)**"); st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
 
     # Distribuciones
     dfh = df0.copy()
@@ -541,16 +611,20 @@ if section == "Resumen":
     dfh["Día semana"] = dfh["_fecha"].apply(lambda d: ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"][d.weekday()] if d else None)
     by_dow = dfh.groupby("Día semana")["Mesa"].count().reindex(["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]).fillna(0).reset_index(name="Mesas")
     c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("**Mesas por día de la semana**")
-        st.plotly_chart(px.bar(by_dow, x="Día semana", y="Mesas", height=300), use_container_width=True)
+    with c3: st.markdown("**Mesas por día de la semana**"); st.plotly_chart(px.bar(by_dow, x="Día semana", y="Mesas", height=300), use_container_width=True)
     with c4:
         st.markdown("**Horas de inicio (histograma)**")
         hh = [t.hour for t in dfh["_ini"] if t is not None]
         st.plotly_chart(px.histogram(pd.DataFrame({"Hora": hh}), x="Hora", nbins=12, height=300), use_container_width=True)
 
+    # Export PDF rápido (muestra)
+    try:
+        _cols = [c for c in ["Mesa","Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable"] if c in df0.columns]
+        export_pdf_simple("Resumen de Mesas", df0[_cols].head(50), "resumen_mesas.pdf")
+    except Exception:
+        pass
+
     st.markdown("### ⬇️ Exportadores rápidos")
-    # ICS por Persona/Aula
     people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                     + df0["Responsable"].dropna().astype(str).tolist()
                                     + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
@@ -566,8 +640,6 @@ if section == "Resumen":
             if not rows.empty:
                 st.download_button("Descargar ICS (persona)", data=build_ics(rows, calendar_name=f"Agenda — {psel}"),
                                    mime="text/calendar", file_name=f"agenda_{psel}.ics")
-            else:
-                st.info("Sin eventos para esta persona.")
     with c2:
         aulas = sorted(df0["Aula"].dropna().astype(str).unique().tolist())
         asel = st.selectbox("ICS por aula", options=["(ninguna)"]+aulas, index=0)
@@ -587,8 +659,7 @@ elif section == "Consulta":
             today = date.today(); dmin, dmax = today, today
         with c1:
             qp_rng = get_qp("rng", default=None, parse_json=True)
-            dr = st.date_input("Rango de fechas", value=(dmin, dmax) if not qp_rng else (date.fromisoformat(qp_rng[0]), date.fromisoformat(qp_rng[1])),
-                               min_value=dmin, max_value=dmax)
+            dr = st.date_input("Rango de fechas", value=(dmin, dmax) if not qp_rng else (date.fromisoformat(qp_rng[0]), date.fromisoformat(qp_rng[1])), min_value=dmin, max_value=dmax)
             fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
             horas = st.slider("Rango de horas", 0, 23, (6, 20))
         with c2:
@@ -605,7 +676,7 @@ elif section == "Consulta":
     people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                     + df0["Responsable"].dropna().astype(str).tolist()
                                     + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
-    term = st.selectbox("Participante", options=[""]+people, index=0) if modo=="Seleccionar" else st.text_input("Escriba parte del nombre")
+    term = st.selectbox("Participante", options=[""]+people, index=0) if modo=="Seleccionar" else st.text_input("Escriba parte del nombre", value=st.query_params.get("q",""))
     set_qp(q=term)
 
     mask = pd.Series([True]*len(idx))
@@ -643,7 +714,7 @@ elif section == "Consulta":
     res = ensure_sorted(res)
 
     c1, c2, c3, c4 = st.columns(4)
-    def make_stats(df: pd.DataFrame):
+    def make_stats(df):
         n_mesas = df.shape[0]
         aulas = df["Aula"].dropna().astype(str).nunique() if "Aula" in df else 0
         dias = df["Fecha"].apply(_to_date).dropna().nunique() if "Fecha" in df else 0
@@ -676,25 +747,21 @@ elif section == "Consulta":
                 t = _to_time(v)
                 return t.strftime("%H:%M") if t else _safe_str(v)
             rf[c] = rf[c].apply(_fmt_hhmm)
-
-        rf.insert(0, "Delegación", rf["Requiere Delegación"].apply(lambda x: "🔴" if bool(x) else "—"))
+        rf.insert(0,"Delegación", rf["Requiere Delegación"].apply(lambda x: "🔴" if bool(x) else "—"))
         ordered = ["Delegación","Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación"]
         rf = rf[[c for c in ordered if c in rf.columns]]
         st.dataframe(rf, use_container_width=True, hide_index=True)
 
         st.markdown("#### ⬇️ Descargas")
-        st.download_button("CSV (filtro)", data=rf.to_csv(index=False).encode("utf-8-sig"),
-                           mime="text/csv", file_name="resultados.csv")
+        st.download_button("CSV (filtro)", data=rf.to_csv(index=False).encode("utf-8-sig"), mime="text/csv", file_name="resultados.csv")
         xls_buf = io.BytesIO()
         with pd.ExcelWriter(xls_buf, engine="xlsxwriter") as w: rf.to_excel(w, sheet_name="Resultados", index=False)
-        st.download_button("Excel (filtro)", data=xls_buf.getvalue(),
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           file_name="resultados.xlsx")
+        st.download_button("Excel (filtro)", data=xls_buf.getvalue(), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_name="resultados.xlsx")
         calname = f"Mesas — {term}" if term else "Mesas"
-        st.download_button("ICS (todo en uno)", data=build_ics(rf, calendar_name=calname),
-                           mime="text/calendar", file_name="mesas.ics")
-        st.download_button("ICS por mesa (ZIP)", data=zip_split_ics(rf),
-                           mime="application/zip", file_name="mesas_por_mesa.zip")
+        st.download_button("ICS (todo en uno)", data=build_ics(rf, calendar_name=calname), mime="text/calendar", file_name="mesas.ics")
+        st.download_button("ICS por mesa (ZIP)", data=zip_split_ics(rf), mime="application/zip", file_name="mesas_por_mesa.zip")
+        try: export_pdf_simple("Consulta — Resultados", rf, "consulta_resultados.pdf")
+        except Exception: pass
 
 elif section == "Agenda":
     st.subheader("🗓️ Agenda por persona")
@@ -714,15 +781,13 @@ elif section == "Agenda":
             for _, r in rows.iterrows():
                 st.markdown(f"**{_safe_str(r['Nombre de la mesa'])}**  \n{_to_date(r['Fecha'])} • {_to_time(r['Inicio']).strftime('%H:%M') if _to_time(r['Inicio']) else ''}–{_to_time(r['Fin']).strftime('%H:%M') if _to_time(r['Fin']) else ''} • Aula: {_safe_str(r['Aula'])}  \n<span class='small'>Resp.: {_safe_str(r['Responsable'])} • Co-resp.: {_safe_str(r['Corresponsable'])} • Delegación: {'Sí' if r['Requiere Delegación'] else 'No'}</span>", unsafe_allow_html=True)
                 st.divider()
-            st.download_button("⬇️ ICS (Agenda)", data=build_ics(rows, calendar_name=f"Agenda — {persona}"),
-                               mime="text/calendar", file_name=f"agenda_{persona}.ics")
-            # Mini Gantt
+            st.download_button("⬇️ ICS (Agenda)", data=build_ics(rows, calendar_name=f"Agenda — {persona}"), mime="text/calendar", file_name=f"agenda_{persona}.ics")
+            # mini-gantt
             gantt_rows = []
             for _, r in rows.iterrows():
                 start = combine_dt(r.get("Fecha"), r.get("Inicio")); end = combine_dt(r.get("Fecha"), r.get("Fin"))
                 if not (start and end): continue
-                gantt_rows.append({"Mesa": _safe_str(r.get("Nombre de la mesa")), "Aula": _safe_str(r.get("Aula")), "start": start, "end": end,
-                                   "Delegación": "Sí" if r.get("Requiere Delegación") else "No"})
+                gantt_rows.append({"Mesa": _safe_str(r.get("Nombre de la mesa")), "Aula": _safe_str(r.get("Aula")), "start": start, "end": end, "Delegación": "Sí" if r.get("Requiere Delegación") else "No"})
             if gantt_rows:
                 dfg = pd.DataFrame(gantt_rows)
                 fig = px.timeline(dfg, x_start="start", x_end="end", y="Aula", color="Delegación", hover_data=["Mesa"])
@@ -736,10 +801,8 @@ elif section == "Gantt":
     for _, r in df0.iterrows():
         start = combine_dt(r.get("Fecha"), r.get("Inicio")); end = combine_dt(r.get("Fecha"), r.get("Fin"))
         if not (start and end): continue
-        rows.append({"Mesa": _safe_str(r.get("Nombre de la mesa")), "Aula": _safe_str(r.get("Aula")),
-                     "start": start, "end": end, "Delegación": "Sí" if r.get("Requiere Delegación") else "No"})
-    if not rows:
-        st.info("No hay datos para Gantt.")
+        rows.append({"Mesa": _safe_str(r.get("Nombre de la mesa")), "Aula": _safe_str(r.get("Aula")), "start": start, "end": end, "Delegación": "Sí" if r.get("Requiere Delegación") else "No"})
+    if not rows: st.info("No hay datos para Gantt.")
     else:
         dfg = pd.DataFrame(rows)
         fig = px.timeline(dfg, x_start="start", x_end="end", y="Aula", color="Delegación", hover_data=["Mesa"])
@@ -752,8 +815,7 @@ elif section == "Heatmap":
     dfh = df0.copy()
     dfh["Día"] = dfh["Fecha"].apply(_to_date)
     piv = pd.pivot_table(dfh, index="Aula", columns="Día", values="Mesa", aggfunc="count", fill_value=0)
-    if piv.empty:
-        st.info("No hay datos para el heatmap.")
+    if piv.empty: st.info("No hay datos para el heatmap.")
     else:
         fig = px.imshow(piv, aspect="auto", labels=dict(color="Mesas"))
         fig.update_layout(height=500, margin=dict(l=10,r=10,t=30,b=20))
@@ -762,20 +824,22 @@ elif section == "Heatmap":
 elif section == "Conflictos":
     st.subheader("🚦 Solapes (personas / aulas)")
     c1, c2, c3 = st.columns(3)
-    with c1:
-        scope = st.radio("Ámbito", ["Personas","Aulas"], horizontal=True)
+    with c1: scope = st.radio("Ámbito", ["Personas","Aulas"], horizontal=True)
     with c2:
-        aplicar_deleg = st.checkbox("Aplicar delegaciones (ignorar eventos delegados)", value=True)
-    with c3:
-        brecha = st.slider("Brecha mínima (min)", 0, 60, 10, help="Minutos de colchón entre eventos para no considerar solape.")
+        if READONLY:
+            st.caption("Perfil lectura: las delegaciones se respetan siempre.")
+            aplicar_deleg = True
+        else:
+            aplicar_deleg = st.checkbox("Aplicar delegaciones (ignorar eventos delegados)", value=True)
+    with c3: brecha = st.slider("Brecha mínima (min)", 0, 60, 10)
 
+    dfc = pd.DataFrame()
     if scope == "Personas":
         people = sorted({p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                                         + df0["Responsable"].dropna().astype(str).tolist()
                                         + df0["Corresponsable"].dropna().astype(str).tolist()) if p})
         psel = st.multiselect("Personas a auditar", options=people)
-        if not psel:
-            st.info("Seleccione una o más personas.")
+        if not psel: st.info("Seleccione una o más personas.")
         else:
             conf_rows = []
             for person in psel:
@@ -793,24 +857,17 @@ elif section == "Conflictos":
                 for i in range(len(evs)):
                     for j in range(i+1, len(evs)):
                         a, b = evs[i], evs[j]
-                        # brecha: considerar solape si a.end + brecha > b.start
                         if (a["end"] + timedelta(minutes=brecha)) > b["start"] and a["start"].date()==b["start"].date():
                             conf_rows.append({
                                 "Persona": person,
                                 "Mesa A": a["Mesa"], "Aula A": a["Aula"], "Inicio A": a["start"], "Fin A": a["end"],
                                 "Mesa B": b["Mesa"], "Aula B": b["Aula"], "Inicio B": b["start"], "Fin B": b["end"],
                             })
-            if not conf_rows:
-                st.success("Sin solapes detectados. ✅")
-            else:
-                dfc = pd.DataFrame(conf_rows)
-                st.dataframe(dfc, use_container_width=True, hide_index=True)
+            dfc = pd.DataFrame(conf_rows)
     else:
-        # Aulas
         aulas = sorted(df0["Aula"].dropna().astype(str).unique().tolist())
         asel = st.multiselect("Aulas a auditar", options=aulas)
-        if not asel:
-            st.info("Seleccione una o más aulas.")
+        if not asel: st.info("Seleccione una o más aulas.")
         else:
             conf_rows = []
             for aula in asel:
@@ -829,26 +886,55 @@ elif section == "Conflictos":
                                 "Mesa A": a["Mesa"], "Inicio A": a["start"], "Fin A": a["end"],
                                 "Mesa B": b["Mesa"], "Inicio B": b["start"], "Fin B": b["end"],
                             })
-            if not conf_rows:
-                st.success("Sin solapes de aulas. ✅")
-            else:
-                dfc = pd.DataFrame(conf_rows)
-                st.dataframe(dfc, use_container_width=True, hide_index=True)
+            dfc = pd.DataFrame(conf_rows)
+
+    if dfc.empty:
+        st.success("Sin solapes detectados. ✅")
+    else:
+        st.dataframe(dfc, use_container_width=True, hide_index=True)
+        # micro-timeline visual
+        try:
+            if "Persona" in dfc.columns:
+                who = sorted(dfc["Persona"].unique().tolist())[0]
+                focus = []
+                for _, r in dfc.iterrows():
+                    focus += [
+                        {"Etiqueta":"A", "Nombre": r["Mesa A"], "start": r["Inicio A"], "end": r["Fin A"]},
+                        {"Etiqueta":"B", "Nombre": r["Mesa B"], "start": r["Inicio B"], "end": r["Fin B"]},
+                    ]
+                dff = pd.DataFrame(focus)
+                fig = px.timeline(dff, x_start="start", x_end="end", y="Etiqueta", color="Nombre", hover_data=["Nombre"])
+                fig.update_yaxes(autorange="reversed")
+                fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10), title=f"Solapes visuales — {who}")
+                st.plotly_chart(fig, use_container_width=True)
+            elif "Aula" in dfc.columns:
+                aula = sorted(dfc["Aula"].unique().tolist())[0]
+                focus = []
+                for _, r in dfc.iterrows():
+                    focus += [
+                        {"Etiqueta":"A", "Nombre": r["Mesa A"], "start": r["Inicio A"], "end": r["Fin A"]},
+                        {"Etiqueta":"B", "Nombre": r["Mesa B"], "start": r["Inicio B"], "end": r["Fin B"]},
+                    ]
+                dff = pd.DataFrame(focus)
+                fig = px.timeline(dff, x_start="start", x_end="end", y="Etiqueta", color="Nombre", hover_data=["Nombre"])
+                fig.update_yaxes(autorange="reversed")
+                fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10), title=f"Solapes visuales — Aula {aula}")
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            pass
+
+        try: export_pdf_simple("Reporte de Conflictos", dfc, "conflictos.pdf")
+        except Exception: pass
 
 elif section == "Disponibilidad":
     st.subheader("🟢 Buscador de disponibilidad (personas / aulas)")
     c1, c2, c3 = st.columns(3)
-    with c1:
-        mode = st.radio("Modo", ["Personas","Aulas"], horizontal=True)
-    with c2:
-        ventana = st.slider("Duración mínima (min)", 15, 240, 60, 15)
-    with c3:
-        margen = st.slider("Margen (min)", 0, 60, 10, 5, help="Colchón a cada lado de los eventos ocupados.")
-    # Rango
+    with c1: mode = st.radio("Modo", ["Personas","Aulas"], horizontal=True)
+    with c2: ventana = st.slider("Duración mínima (min)", 15, 240, 60, 15)
+    with c3: margen = st.slider("Margen (min)", 0, 60, 10, 5, help="Colchón a cada lado de los eventos ocupados.")
     fechas_validas = [d for d in df0["Fecha"].apply(_to_date).dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-    else:
-        today = date.today(); dmin, dmax = today, today
+    else: today = date.today(); dmin, dmax = today, today
     dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
 
     def _slots_free(events: List[Tuple[datetime, datetime]], day: date):
@@ -906,8 +992,7 @@ elif section == "Disponibilidad":
         if rows_out:
             out = pd.DataFrame(rows_out).sort_values(by=["Nombre","Día","Libre desde"])
             st.dataframe(out, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ CSV (disponibilidad)", data=out.to_csv(index=False).encode("utf-8-sig"),
-                               mime="text/csv", file_name="disponibilidad.csv")
+            st.download_button("⬇️ CSV (disponibilidad)", data=out.to_csv(index=False).encode("utf-8-sig"), mime="text/csv", file_name="disponibilidad.csv")
         else:
             st.info("No se encontraron huecos con esos parámetros.")
 
@@ -915,16 +1000,12 @@ elif section == "Delegaciones":
     st.subheader("🛟 Reporte de Delegaciones")
     cols = ["Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación"]
     rep = df0[df0["Requiere Delegación"]==True][cols].copy()
-    if rep.empty:
-        st.info("No hay mesas marcadas con 'Requiere Delegación'.")
+    if rep.empty: st.info("No hay mesas marcadas con 'Requiere Delegación'.")
     else:
         st.dataframe(rep, use_container_width=True, hide_index=True)
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            rep.to_excel(w, sheet_name="Delegaciones", index=False)
-        st.download_button("⬇️ Delegaciones (Excel)", data=buf.getvalue(),
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           file_name="delegaciones.xlsx")
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w: rep.to_excel(w, sheet_name="Delegaciones", index=False)
+        st.download_button("⬇️ Delegaciones (Excel)", data=buf.getvalue(), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_name="delegaciones.xlsx")
 
 elif section == "Diagnóstico":
     st.subheader("🧪 Diagnóstico y construcción")
@@ -936,13 +1017,21 @@ elif section == "Diagnóstico":
     except Exception:
         st.session_state.tz = TZ_DEFAULT
 
+    # Auditoría estricta
     issues = []
-    # Nulos clave
-    for key in ["Nombre de la mesa","Fecha","Inicio","Fin"]:
-        if key in df0.columns:
-            n_null = int(pd.isna(df0[key]).sum())
-            if n_null > 0: issues.append(f"Hay {n_null} nulos en '{key}'.")
-    # Duración negativa
+    audit_rows = []
+    def _err(row, col, msg): audit_rows.append({"Fila": int(row)+2, "Columna": col, "Detalle": msg})
+    for i, r in df0.iterrows():
+        if _to_date(r.get("Fecha")) is None: _err(i,"Fecha","Fecha inválida/vacía")
+        t1, t2 = _to_time(r.get("Inicio")), _to_time(r.get("Fin"))
+        if t1 is None: _err(i,"Inicio","Hora inválida/vacía")
+        if t2 is None: _err(i,"Fin","Hora inválida/vacía")
+        if t1 and t2 and (datetime.combine(date(2000,1,1), t2) <= datetime.combine(date(2000,1,1), t1)):
+            _err(i,"Fin","Fin ≤ Inicio")
+        if not _safe_str(r.get("Aula")): _err(i,"Aula","Vacía")
+    if audit_rows: issues.append("Se hallaron problemas puntuales (ver tabla).")
+
+    # Duraciones negativas (por seguridad duplicada)
     if all(k in df0.columns for k in ["Fecha","Inicio","Fin"]):
         def dur(a,b):
             ta, tb = _to_time(a), _to_time(b)
@@ -951,17 +1040,19 @@ elif section == "Diagnóstico":
         dur_min = df0.apply(lambda r: dur(r["Inicio"], r["Fin"]), axis=1)
         if (pd.Series(dur_min).dropna() < 0).any():
             issues.append("Existen filas con duraciones negativas (Fin < Inicio).")
+
     # Duplicados exactos
     if all(k in df0.columns for k in ["Fecha","Inicio","Aula","Nombre de la mesa"]):
         n_dups = int(df0.duplicated(subset=["Fecha","Inicio","Aula","Nombre de la mesa"], keep=False).sum())
         if n_dups: issues.append(f"{n_dups} duplicados por (Fecha, Inicio, Aula, Nombre).")
-    # Nombres inconsistentes (misma persona con dos formas)
-    ppl = idx["__norm_part"].value_counts()
-    inconsistent = [p for p,c in ppl.items() if p and "  " not in p and c>=1]  # placeholder simple
+
     st.markdown("**Resultado**")
     if not issues: st.success("Sin problemas críticos detectados. ✅")
     else:
         for it in issues: st.error("• " + it)
+    if audit_rows:
+        st.markdown("**Auditoría de filas/columnas**")
+        st.dataframe(pd.DataFrame(audit_rows).head(500), use_container_width=True, hide_index=True)
 
     st.markdown("—")
     st.markdown("**Vista rápida**")
@@ -982,23 +1073,26 @@ elif section == "Diagnóstico":
         b64_main = _b64_or_empty(dev_streamlit_path)
         b64_deleg = _b64_or_empty(dev_deleg_path)
         src = inspect.getsource(sys.modules[__name__])
-        # Reemplazar los placeholders
         src = re.sub(r'_EMBED_XLSX_B64\s*=\s*""', f'_EMBED_XLSX_B64 = """{b64_main}"""', src, count=1)
         src = re.sub(r'_EMBED_DELEG_B64\s*=\s*""', f'_EMBED_DELEG_B64 = """{b64_deleg}"""', src, count=1)
         file_bytes = src.encode("utf-8")
         st.download_button("⬇️ app_embebida.py", data=file_bytes, mime="text/x-python", file_name="app_embebida.py")
-
-        # ZIP con README + ICS ejemplo
         ics_example = build_ics(df0.head(3), calendar_name="Ejemplo")
         mem = io.BytesIO()
         with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("app_embebida.py", file_bytes)
-            z.writestr("README_minimo.md", "# Mesas — ULTRA PRO MAX\nEjecuta con: `streamlit run app_embebida.py`.\n")
+            z.writestr("README_minimo.md", "# Mesas — INIMAGINABLE\nEjecuta: `streamlit run app_embebida.py`.\n")
             z.writestr("ejemplo.ics", ics_example)
         mem.seek(0)
-        st.download_button("⬇️ paquete.zip", data=mem.getvalue(), mime="application/zip", file_name="paquete_ultra_pro_max.zip")
+        st.download_button("⬇️ paquete.zip", data=mem.getvalue(), mime="application/zip", file_name="paquete_inimaginable.zip")
+
+    st.markdown("—")
+    st.markdown("### 📦 Snapshots")
+    colA, colB = st.columns(2)
+    with colA: snapshot_state_export()
+    with colB: snapshot_state_import()
 
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 13/09/2025 — ULTRA PRO MAX")
-    st.markdown("• Delegaciones por día o por rango horario.\n• Conflictos por personas y aulas con brecha.\n• Buscador de disponibilidad.\n• URL compartible, exportadores y empaquetado embebido.\n")
+    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE")
+    st.markdown("• Omnibox, perfiles, delegaciones por horario.\n• Conflictos con brecha y visual inmediato.\n• Disponibilidad y exportadores (CSV/Excel/ICS/ZIP/PDF/HTML).\n• Snapshots de estado y empaquetado embebido.\n")
