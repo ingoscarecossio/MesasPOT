@@ -36,7 +36,7 @@ except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
 # ========= UI base =========
-st.set_page_config(page_title="Mesas · INIMAGINABLE", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Planificador de Mesas y Agenda POT", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
 
 def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     if _BG_B64:
@@ -209,7 +209,7 @@ with st.sidebar:
 
 inject_base_css(st.session_state.dark, ui_dark, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Mesas · INIMAGINABLE</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='gradient-title'>🗂️ Planificador de Mesas y Agenda POT</h1>", unsafe_allow_html=True)
 st.caption("Omnibox • Weekdays-only • Delegaciones desde archivo • Conflictos sweep-line • Exportes completos")
 
 # ========= Perfiles =========
@@ -985,4 +985,4 @@ elif section == "Diagnóstico":
 # ---------------- Acerca de ----------------
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE+ (Resumen con gráficos • Vistas guardadas • Calidad • Diff • Recomendador)")
+    st.markdown("Publicación: 13/09/2025 — Planificador de Mesas y Agenda POT + (Resumen con gráficos • Vistas guardadas • Calidad • Diff • Recomendador)")
