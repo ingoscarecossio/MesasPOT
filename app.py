@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Mesas ·  — versión auditada/optimizada (Weekdays only + date_input safe)
+Mesas · INIMAGINABLE — versión auditada/optimizada (Weekdays only + date_input safe)
 - Fechas AAAA-MM-DD, sin sábado ni domingo en toda la app
 - Máscara alineada (sin IndexingError)
 - date_input con parseo seguro y clamp a [dmin, dmax]
@@ -9,7 +9,7 @@ Mesas ·  — versión auditada/optimizada (Weekdays only + date_input safe)
 - Delegaciones 2.0 + conflictos sweep-line
 - Persistencia de estado en URL
 """
-import io, re, uuid, zipfile, base64, unicodedata, difflib, os, inspect, sys, json, hashlib
+import io, re, uuid, zipfile, base64, unicodedata, difflib, os, json, hashlib
 from datetime import datetime, date, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -36,7 +36,7 @@ except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
 # ========= UI base =========
-st.set_page_config(page_title="Mesas · ", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Mesas · INIMAGINABLE", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
 
 def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     if _BG_B64:
@@ -109,18 +109,16 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
         mapping[col] = canonical
     return df.rename(columns=mapping)
 
-# ▶︎ Fechas estrictas AAAA-MM-DD (evita falsos sábados/domingos)
+# ▶︎ Fechas estrictas AAAA-MM-DD
 def _to_date(x):
     if isinstance(x, date) and not isinstance(x, datetime): return x
     if isinstance(x, datetime): return x.date()
     if pd.isna(x): return None
-    # 1) formato ISO exacto
     try:
         s = str(x).strip()
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         pass
-    # 2) fallback: pandas (num excel / timestamp)
     d = pd.to_datetime(x, errors="coerce", utc=False)
     return None if pd.isna(d) else (d.date() if isinstance(d, pd.Timestamp) else None)
 
@@ -222,7 +220,7 @@ with st.sidebar:
 
 inject_base_css(st.session_state.dark, ui_dark, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Mesas · </h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='gradient-title'>🗂️ Mesas · INIMAGINABLE</h1>", unsafe_allow_html=True)
 st.caption("Omnibox • Weekdays-only • Delegaciones 2.0 • Conflictos sweep-line • Exportes completos")
 
 # ========= Perfiles =========
@@ -259,14 +257,11 @@ for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la 
     if col in df0.columns: df0[f"__norm_{col}"] = df0[col].fillna("").astype(str).apply(_norm)
 df0 = ensure_sorted(df0)
 
-# Weekdays only (Mon-Fri)
+# Weekdays only y meses 9–10
 def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
-
-# Solo septiembre y octubre + solo lunes-viernes
 def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
     return _is_weekday(d) and (d.month in (9, 10))
-
 DF = df0[df0["_fecha"].apply(_only_sep_oct_weekdays)].copy()
 
 # Index expandido (personas)
@@ -472,20 +467,15 @@ def _parse_iso_date(s) -> Optional[date]:
         return date.fromisoformat(str(s)[:10])
     except Exception:
         return None
-
 def _safe_range_from_qp(qp_rng, dmin: date, dmax: date) -> Tuple[date, date]:
-    """Toma query param (lista/tupla) y devuelve un rango dentro [dmin, dmax], ordenado."""
     s, e = dmin, dmax
     if isinstance(qp_rng, (list, tuple)) and len(qp_rng) == 2:
         ps, pe = _parse_iso_date(qp_rng[0]), _parse_iso_date(qp_rng[1])
         if ps: s = ps
         if pe: e = pe
-    # ordenar
     if s > e: s, e = e, s
-    # clamp
     s = max(dmin, min(s, dmax))
     e = max(dmin, min(e, dmax))
-    # si queda vacío por clamp, expande a todo el rango
     if s > e: s, e = dmin, dmax
     return s, e
 
@@ -522,8 +512,16 @@ if section == "Resumen":
     top_people = s.value_counts().head(10).rename_axis("Persona").reset_index(name="Conteo")
     uso_aula = DFu.groupby("Aula")["Nombre de la mesa"].count().sort_values(ascending=False).head(10).rename_axis("Aula").reset_index(name="Mesas")
     cc1, cc2 = st.columns(2)
-    with cc1: st.markdown("**Top 10 personas por participación**"); st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
-    with cc2: st.markdown("**Aulas más usadas (Top 10)**"); st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
+    with cc1: st.markdown("**Top 10 personas por participación**"); 
+    if not top_people.empty:
+        st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
+    else:
+        st.info("Sin datos de personas.")
+    with cc2: st.markdown("**Aulas más usadas (Top 10)**"); 
+    if not uso_aula.empty:
+        st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
+    else:
+        st.info("Sin datos de aulas.")
 
     # Mesas por día (Lun–Vie)
     dfh = DFu.dropna(subset=["_fecha"]).copy()
@@ -539,81 +537,91 @@ if section == "Resumen":
 
 elif section == "Consulta":
     with st.expander("⚙️ Filtros (Lun–Vie, Sep–Oct)", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns([1,1,1,0.6])
+
+        # Rango natural de la data ya filtrada a Lun–Vie Sep–Oct
         fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
         if fechas_validas:
             dmin, dmax = min(fechas_validas), max(fechas_validas)
         else:
             today = date.today(); dmin, dmax = today, today
-        # Garantizar orden
         if dmin > dmax: dmin, dmax = dmax, dmin
 
         with c1:
-            qp_rng = get_qp("rng", default=None, parse_json=True)
+            qp_rng = get_qp("rng", default=None, parse_json=True) if "rng" in st.query_params else None
             s_val, e_val = _safe_range_from_qp(qp_rng, dmin, dmax)
-            dr = st.date_input("Rango de fechas", value=(s_val, e_val), min_value=dmin, max_value=dmax)
+            dr = st.date_input("Rango de fechas", value=(s_val, e_val),
+                               min_value=dmin, max_value=dmax, key="consulta_rango")
             fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
-            horas = st.slider("Rango de horas", 0, 23, (6, 20))
+            horas = st.slider("Rango de horas", 0, 23, (6, 20), key="consulta_horas")
 
         with c2:
             aulas = sorted(DF["Aula"].dropna().astype(str).unique().tolist())
-            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=get_qp("aulas",["(todas)"],True))
-            # Solo Lun–Vie
+            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas,
+                                      default=get_qp("aulas",["(todas)"],True), key="consulta_aulas")
             dow_opts = ["Lun","Mar","Mié","Jue","Vie"]
             dow_default = ["Lun","Mar","Mié","Jue","Vie"]
-            dow = st.multiselect("Días semana", dow_opts, default=get_qp("dows", dow_default, True))
+            dow = st.multiselect("Días semana", dow_opts,
+                                 default=get_qp("dows", dow_default, True), key="consulta_dow")
             dow = [d for d in dow if d in dow_opts]
 
         with c3:
             responsables = sorted(DF["Responsable"].dropna().astype(str).unique().tolist())
-            rsel = st.multiselect("Responsables", responsables, default=get_qp("resp",[],True))
+            rsel = st.multiselect("Responsables", responsables,
+                                  default=get_qp("resp",[],True), key="consulta_resp")
             solo_deleg = st.checkbox("🔴 Solo mesas que requieren delegación",
-                                     value=bool(get_qp("sdel","false") in ("true","True","1")))
+                                     value=bool(get_qp("sdel","false") in ("true","True","1")),
+                                     key="consulta_sdel")
 
-        set_qp(rng=(fmin.isoformat(), fmax.isoformat()), aulas=aula_sel, dows=dow, resp=rsel, sdel=solo_deleg)
+        with c4:
+            st.markdown("&nbsp;")
+            if st.button("↺ Restablecer filtros", use_container_width=True):
+                for k in ["rng","aulas","dows","resp","sdel","q"]:
+                    if k in st.query_params: del st.query_params[k]
+                st.rerun()
 
-    modo = st.radio("Búsqueda", ["Seleccionar", "Texto"], index=0, horizontal=True)
+        # Chip informativo del rango activo
+        st.caption(f"**Rango activo:** {fmin.isoformat()} → {fmax.isoformat()} · {(fmax - fmin).days + 1} días")
+
+        # Persistir estado
+        set_qp(rng=(fmin.isoformat(), fmax.isoformat()),
+               aulas=aula_sel, dows=dow, resp=rsel, sdel=solo_deleg)
+
+    modo = st.radio("Búsqueda", ["Seleccionar", "Texto"], index=0, horizontal=True, key="consulta_modo")
     people = sorted({
         p for p in set(idx["Participante_individual"].dropna().astype(str).tolist()
                        + DF["Responsable"].dropna().astype(str).tolist()
                        + DF["Corresponsable"].dropna().astype(str).tolist()) if p
     })
     term = (
-        st.selectbox("Participante", options=[""]+people, index=0)
+        st.selectbox("Participante", options=[""]+people, index=0, key="consulta_part")
         if modo=="Seleccionar" else
-        st.text_input("Escriba parte del nombre", value=st.query_params.get("q",""))
+        st.text_input("Escriba parte del nombre", value=st.query_params.get("q",""), key="consulta_term")
     )
     set_qp(q=term)
 
-    # ✅ MASK ALINEADO AL ÍNDICE DE idx
+    # Máscara alineada
     mask = pd.Series(True, index=idx.index, dtype=bool)
 
-    # Fechas
     mask &= idx["_fecha"].apply(lambda d: (d is not None) and (fmin <= d <= fmax))
 
-    # Aulas
     if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
         allowed = set([a for a in aula_sel if a != "(todas)"])
         mask &= idx["Aula"].fillna("").astype(str).isin(allowed)
 
-    # Días (Lun–Vie)
     dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
     selected_dows = [dows[x] for x in dow] if dow else list(dows.values())
     mask &= idx["_fecha"].apply(lambda dd: dd is not None and dd.weekday() in selected_dows)
 
-    # Horas
     hmin, hmax = horas
     mask &= idx["_ini"].apply(lambda t: (t is not None) and (hmin <= t.hour <= hmax))
 
-    # Responsables
     if rsel:
         mask &= idx["Responsable"].fillna("").astype(str).isin(set(rsel))
 
-    # Delegaciones
     if solo_deleg:
         mask &= idx["Requiere Delegación"] == True
 
-    # Texto
     if term:
         mask &= (
             smart_match(idx["__norm_part"], term) |
@@ -628,10 +636,9 @@ elif section == "Consulta":
             "Requiere Delegación","_fecha","_ini","_fin"]
 
     res_idx = idx.loc[mask, cols].copy()
-    # ▶︎ Deduplicar por clave de evento
     res = _dedup_events(res_idx)
 
-    # KPIs
+    # KPIs (eventos únicos)
     c1, c2, c3, c4 = st.columns(4)
     def make_stats(df):
         base = _dedup_events(df)
@@ -668,7 +675,8 @@ elif section == "Consulta":
         st.markdown("#### ⬇️ Descargas")
         st.download_button("CSV (filtro)", data=rf.to_csv(index=False).encode("utf-8-sig"), mime="text/csv", file_name="resultados.csv")
         xls_buf = io.BytesIO()
-        with pd.ExcelWriter(xls_buf, engine="xlsxwriter") as w: rf.to_excel(w, sheet_name="Resultados", index=False)
+        with pd.ExcelWriter(xls_buf, engine="xlsxwriter") as w: 
+            rf.to_excel(w, sheet_name="Resultados", index=False)
         st.download_button("Excel (filtro)", data=xls_buf.getvalue(), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_name="resultados.xlsx")
         calname = f"Mesas — {term}" if term else "Mesas"
         st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name=calname), mime="text/calendar", file_name="mesas.ics")
@@ -716,7 +724,8 @@ elif section == "Gantt":
         start = combine_dt(r["_fecha"], r["_ini"]); end = combine_dt(r["_fecha"], r["_fin"])
         if not (start and end): continue
         rows.append({"Mesa": _safe_str(r["Nombre de la mesa"]), "Aula": _safe_str(r["Aula"]), "start": start, "end": end, "Delegación": "Sí" if r["Requiere Delegación"] else "No"})
-    if not rows: st.info("No hay datos para Gantt.")
+    if not rows:
+        st.info("No hay datos para Gantt.")
     else:
         dfg = pd.DataFrame(rows)
         fig = px.timeline(dfg, x_start="start", x_end="end", y="Aula", color="Delegación", hover_data=["Mesa"])
@@ -729,7 +738,8 @@ elif section == "Heatmap":
     DFu = _dedup_events(DF)
     dfh = DFu.copy()
     piv = pd.pivot_table(dfh, index="Aula", columns="_fecha", values="Nombre de la mesa", aggfunc="count", fill_value=0)
-    if piv.empty: st.info("No hay datos para el heatmap.")
+    if piv.empty:
+        st.info("No hay datos para el heatmap.")
     else:
         fig = px.imshow(piv, aspect="auto", labels=dict(color="Mesas"))
         fig.update_layout(height=500, margin=dict(l=10,r=10,t=30,b=20))
@@ -742,7 +752,10 @@ elif section == "Conflictos":
     apply_qp = st.query_params.get("applydel", "true")
     gap_qp = st.query_params.get("gap", "10")
     with c2:
-        aplicar_deleg = True if READONLY else st.checkbox("Aplicar delegaciones (ignorar eventos delegados)", value=(apply_qp.lower() in ("true","1","yes")))
+        aplicar_deleg = True if READONLY else st.checkbox(
+            "Aplicar DELEGACIONES.xlsx (ignorar eventos con delegado al buscar solapes)",
+            value=(apply_qp.lower() in ("true","1","yes"))
+        )
     with c3:
         try: gap_default = int(gap_qp)
         except Exception: gap_default = 10
@@ -769,7 +782,8 @@ elif section == "Conflictos":
                            + DF["Corresponsable"].dropna().astype(str).tolist()) if p
         })
         psel = st.multiselect("Personas a auditar", options=people)
-        if not psel: st.info("Seleccione una o más personas.")
+        if not psel:
+            st.info("Seleccione una o más personas.")
         else:
             conf_rows = []
             base_idx = idx if not aplicar_deleg else idx[idx["__delegado_por_archivo"] == False]
@@ -793,7 +807,8 @@ elif section == "Conflictos":
     else:
         aulas = sorted(DF["Aula"].dropna().astype(str).unique().tolist())
         asel = st.multiselect("Aulas a auditar", options=aulas)
-        if not asel: st.info("Seleccione una o más aulas.")
+        if not asel:
+            st.info("Seleccione una o más aulas.")
         else:
             conf_rows = []
             for aula in asel:
@@ -825,8 +840,7 @@ elif section == "Disponibilidad":
     fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
     else: today = date.today(); dmin, dmax = today, today
-    if dmin > dmax: dmin, dmax = dmax, dmin  # seguridad
-    # valor seguro dentro de rango
+    if dmin > dmax: dmin, dmax = dmax, dmin
     dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
 
     def _slots_free(events: List[Tuple[datetime, datetime]], day: date):
@@ -895,7 +909,8 @@ elif section == "Delegaciones":
     DFu = _dedup_events(DF)
     cols = ["Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación"]
     rep = DFu[DFu["Requiere Delegación"]==True][cols].copy()
-    if rep.empty: st.info("No hay mesas marcadas con 'Requiere Delegación'.")
+    if rep.empty:
+        st.info("No hay mesas marcadas con 'Requiere Delegación'.")
     else:
         rep["Fecha"] = DFu.loc[rep.index, "_fecha"].apply(lambda d: d.isoformat() if d else "")
         st.dataframe(rep, use_container_width=True, hide_index=True)
@@ -914,34 +929,22 @@ elif section == "Diagnóstico":
 
     DFu = _dedup_events(DF)
     issues = []
-    audit_rows = []
-    def _err(row, col, msg): audit_rows.append({"Fila": int(row)+2, "Columna": col, "Detalle": msg})
+    def _err(row, col, msg): issues.append(f"Fila {int(row)+2} — {col}: {msg}")
 
     for i, r in DFu.iterrows():
-        if r.get("_fecha") is None:
-            _err(i,"Fecha", f"Inválida/vacía (valor='{_safe_str(r.get('Fecha'))[:24]}')")
+        if r.get("_fecha") is None: _err(i,"Fecha", f"Inválida/vacía (valor='{_safe_str(r.get('Fecha'))[:24]}')")
         t1, t2 = r.get("_ini"), r.get("_fin")
         if t1 is None: _err(i,"Inicio", f"Hora inválida/vacía (valor='{_safe_str(r.get('Inicio'))[:24]}')")
         if t2 is None: _err(i,"Fin",    f"Hora inválida/vacía (valor='{_safe_str(r.get('Fin'))[:24]}')")
         if t1 and t2 and (datetime.combine(date(2000,1,1), t2) <= datetime.combine(date(2000,1,1), t1)):
             _err(i,"Fin", f"Fin ≤ Inicio ({t1} -> {t2})")
-        if not _safe_str(r.get("Aula")): _err(i,"Aula","Vacía")
-
-    if all(k in DFu.columns for k in ["Fecha","Inicio","Fin"]):
-        def dur(a,b):
-            ta, tb = _to_time(a), _to_time(b)
-            if ta is None or tb is None: return None
-            return (datetime.combine(date(2000,1,1), tb) - datetime.combine(date(2000,1,1), ta)).total_seconds()/60.0
-        dur_min = DFu.apply(lambda r: dur(r["Inicio"], r["Fin"]), axis=1)
-        if (pd.Series(dur_min).dropna() < 0).any():
-            issues.append("Existen filas con duraciones negativas (Fin < Inicio).")
 
     if all(c in DFu.columns for c in KEY_COLS[0:4] + ["Nombre de la mesa"]):
         n_dups = int(DFu.duplicated(subset=KEY_COLS, keep=False).sum())
         if n_dups: issues.append(f"{n_dups} duplicados por clave de evento {KEY_COLS}.")
 
-    st.markdown("**Resultado**")
-    if not issues: st.success("Sin problemas críticos detectados. ✅")
+    if not issues:
+        st.success("Sin problemas críticos detectados. ✅")
     else:
         for it in issues: st.error("• " + it)
 
@@ -954,5 +957,5 @@ elif section == "Diagnóstico":
 
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 13/09/2025 —  (auditoría Weekdays-only + date_input safe)")
+    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE (auditoría Weekdays-only + date_input safe)")
     st.markdown("• Fechas `AAAA-MM-DD` estrictas\n• Sin sábado ni domingo en toda la app\n• Máscara alineada (sin IndexingError)\n• date_input con clamp seguro\n• Métricas por evento único\n• ICS robusto y conflictos O(n log n)\n")
