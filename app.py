@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión auditada/optimizada (Weekdays only)
+Mesas ·  — versión auditada/optimizada (Weekdays only + date_input safe)
 - Fechas AAAA-MM-DD, sin sábado ni domingo en toda la app
 - Máscara alineada (sin IndexingError)
+- date_input con parseo seguro y clamp a [dmin, dmax]
 - Contabilización por evento único (Fecha+Inicio+Fin+Aula+Nombre)
 - ICS robusto (escape + folding + UID determinístico)
 - Delegaciones 2.0 + conflictos sweep-line
@@ -35,7 +36,7 @@ except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
 # ========= UI base =========
-st.set_page_config(page_title="Mesas · INIMAGINABLE", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Mesas · ", page_icon="🗂️", layout="wide", initial_sidebar_state="expanded")
 
 def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     if _BG_B64:
@@ -113,13 +114,13 @@ def _to_date(x):
     if isinstance(x, date) and not isinstance(x, datetime): return x
     if isinstance(x, datetime): return x.date()
     if pd.isna(x): return None
-    # Primero: formato ISO exacto
+    # 1) formato ISO exacto
     try:
         s = str(x).strip()
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         pass
-    # Fallback: pandas (números de Excel, Timestamps, etc.)
+    # 2) fallback: pandas (num excel / timestamp)
     d = pd.to_datetime(x, errors="coerce", utc=False)
     return None if pd.isna(d) else (d.date() if isinstance(d, pd.Timestamp) else None)
 
@@ -145,7 +146,6 @@ def combine_dt(fecha, hora, tz: Optional[timezone]=None):
 
 def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Usar precálculos si existen
     if "_fecha" in df.columns and "_ini" in df.columns:
         df.sort_values(by=["_fecha","_ini"], inplace=True, kind="mergesort")
     elif "Fecha" in df.columns and "Inicio" in df.columns:
@@ -222,7 +222,7 @@ with st.sidebar:
 
 inject_base_css(st.session_state.dark, ui_dark, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Mesas · INIMAGINABLE</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='gradient-title'>🗂️ Mesas · </h1>", unsafe_allow_html=True)
 st.caption("Omnibox • Weekdays-only • Delegaciones 2.0 • Conflictos sweep-line • Exportes completos")
 
 # ========= Perfiles =========
@@ -305,7 +305,6 @@ deleg_raw = _try_load_deleg(_EMBED_DELEG_B64)
 def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["__actor","__mesa","__fecha","__ini","__fin"])
-    # detectar columnas
     col_actor = col_mesa = col_fecha = col_ini = col_fin = None
     for c in df.columns:
         cl = str(c).lower()
@@ -335,7 +334,6 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     }).dropna(subset=["__mesa","__fecha"])
     out = out[out["__actor"].astype(bool)]
     return out
-
 deleg_map = _prepare_deleg_map(deleg_raw)
 
 def _token_subset(a: str, b: str) -> bool:
@@ -453,18 +451,6 @@ def build_ics(rows: pd.DataFrame, calendar_name="Mesas"):
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines).encode("utf-8")
 
-def zip_split_ics(rows: pd.DataFrame):
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, r in rows.reset_index(drop=True).iterrows():
-            single_df = pd.DataFrame([r])
-            nombre = _safe_str(r.get("Nombre de la mesa")) or f"mesa_{i+1}"
-            ics_bytes = build_ics(single_df, calendar_name=nombre)
-            safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", nombre)[:64] or f"mesa_{i+1}"
-            zf.writestr(f"{safe}.ics", ics_bytes)
-    mem.seek(0)
-    return mem.getvalue()
-
 # ========= Omnibox =========
 c_omni = st.text_input("🔎 Búsqueda rápida (persona / mesa / aula)", value=st.query_params.get("q",""))
 if c_omni:
@@ -479,6 +465,29 @@ KEY_COLS = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
 def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     if not all(c in df.columns for c in KEY_COLS): return df.copy()
     return df.sort_values(KEY_COLS, kind="mergesort").drop_duplicates(subset=KEY_COLS, keep="first")
+
+# ========= Utilidades de fecha para widgets (FIX) =========
+def _parse_iso_date(s) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except Exception:
+        return None
+
+def _safe_range_from_qp(qp_rng, dmin: date, dmax: date) -> Tuple[date, date]:
+    """Toma query param (lista/tupla) y devuelve un rango dentro [dmin, dmax], ordenado."""
+    s, e = dmin, dmax
+    if isinstance(qp_rng, (list, tuple)) and len(qp_rng) == 2:
+        ps, pe = _parse_iso_date(qp_rng[0]), _parse_iso_date(qp_rng[1])
+        if ps: s = ps
+        if pe: e = pe
+    # ordenar
+    if s > e: s, e = e, s
+    # clamp
+    s = max(dmin, min(s, dmax))
+    e = max(dmin, min(e, dmax))
+    # si queda vacío por clamp, expande a todo el rango
+    if s > e: s, e = dmin, dmax
+    return s, e
 
 # ========= Secciones =========
 if section == "Resumen":
@@ -532,16 +541,17 @@ elif section == "Consulta":
     with st.expander("⚙️ Filtros (Lun–Vie, Sep–Oct)", expanded=False):
         c1, c2, c3 = st.columns(3)
         fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
-        if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-        else: today = date.today(); dmin, dmax = today, today
+        if fechas_validas:
+            dmin, dmax = min(fechas_validas), max(fechas_validas)
+        else:
+            today = date.today(); dmin, dmax = today, today
+        # Garantizar orden
+        if dmin > dmax: dmin, dmax = dmax, dmin
 
         with c1:
             qp_rng = get_qp("rng", default=None, parse_json=True)
-            dr = st.date_input(
-                "Rango de fechas",
-                value=(dmin, dmax) if not qp_rng else (date.fromisoformat(qp_rng[0]), date.fromisoformat(qp_rng[1])),
-                min_value=dmin, max_value=dmax
-            )
+            s_val, e_val = _safe_range_from_qp(qp_rng, dmin, dmax)
+            dr = st.date_input("Rango de fechas", value=(s_val, e_val), min_value=dmin, max_value=dmax)
             fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
             horas = st.slider("Rango de horas", 0, 23, (6, 20))
 
@@ -621,7 +631,7 @@ elif section == "Consulta":
     # ▶︎ Deduplicar por clave de evento
     res = _dedup_events(res_idx)
 
-    # KPIs sobre eventos únicos
+    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     def make_stats(df):
         base = _dedup_events(df)
@@ -662,7 +672,6 @@ elif section == "Consulta":
         st.download_button("Excel (filtro)", data=xls_buf.getvalue(), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_name="resultados.xlsx")
         calname = f"Mesas — {term}" if term else "Mesas"
         st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name=calname), mime="text/calendar", file_name="mesas.ics")
-        st.download_button("ICS por mesa (ZIP)", data=zip_split_ics(res), mime="application/zip", file_name="mesas_por_mesa.zip")
 
 elif section == "Agenda":
     st.subheader("🗓️ Agenda por persona (Lun–Vie, Sep–Oct)")
@@ -774,7 +783,7 @@ elif section == "Conflictos":
                     s = combine_dt(r["_fecha"], r["_ini"]); e = combine_dt(r["_fecha"], r["_fin"])
                     if s and e: evs.append({"Mesa": _safe_str(r["Nombre de la mesa"]), "Aula": _safe_str(r["Aula"]), "start": s, "end": e})
                 for a,b in find_overlaps_sweepline(evs, gap_min=brecha):
-                    if a["start"].date() == b["start"].date():  # ya estamos en Lun–Vie
+                    if a["start"].date() == b["start"].date():
                         conf_rows.append({
                             "Persona": person,
                             "Mesa A": a["Mesa"], "Aula A": a["Aula"], "Inicio A": a["start"], "Fin A": a["end"],
@@ -816,6 +825,8 @@ elif section == "Disponibilidad":
     fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
     else: today = date.today(); dmin, dmax = today, today
+    if dmin > dmax: dmin, dmax = dmax, dmin  # seguridad
+    # valor seguro dentro de rango
     dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax)
 
     def _slots_free(events: List[Tuple[datetime, datetime]], day: date):
@@ -856,7 +867,6 @@ elif section == "Disponibilidad":
                     if not (fmin <= d0 <= fmax): continue
                     by_day.setdefault(d0, []).append((s,e))
                 for d0, events in by_day.items():
-                    # ya estamos en Lun–Vie por construcción
                     for s,e in _slots_free(events, d0):
                         rows_out.append({"Tipo":"Persona","Nombre": person, "Día": d0.isoformat(), "Libre desde": s, "Libre hasta": e, "Minutos": int((e-s).total_seconds()/60)})
         else:
@@ -944,5 +954,5 @@ elif section == "Diagnóstico":
 
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE (auditoría Weekdays-only)")
-    st.markdown("• Fechas `AAAA-MM-DD` estrictas\n• Sin sábado ni domingo en toda la app\n• Máscara alineada (sin IndexingError)\n• Métricas por evento único\n• ICS robusto y conflictos O(n log n)\n")
+    st.markdown("Publicación: 13/09/2025 —  (auditoría Weekdays-only + date_input safe)")
+    st.markdown("• Fechas `AAAA-MM-DD` estrictas\n• Sin sábado ni domingo en toda la app\n• Máscara alineada (sin IndexingError)\n• date_input con clamp seguro\n• Métricas por evento único\n• ICS robusto y conflictos O(n log n)\n")
