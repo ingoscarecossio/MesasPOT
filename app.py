@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión auditada/optimizada (Weekdays only + date_input safe)
-- Fechas AAAA-MM-DD, sin sábado ni domingo en toda la app
+Mesas · INIMAGINABLE — versión auditada/optimizada
+- Fechas AAAA-MM-DD, sin sábados ni domingos (Lun–Vie) y solo Sept–Oct
+- date_input a prueba de errores (clamp + orden)
 - Máscara alineada (sin IndexingError)
-- date_input con parseo seguro y clamp a [dmin, dmax]
 - Contabilización por evento único (Fecha+Inicio+Fin+Aula+Nombre)
 - ICS robusto (escape + folding + UID determinístico)
-- Delegaciones 2.0 + conflictos sweep-line
-- Persistencia de estado en URL
+- Delegaciones 2.0: quiénes deben delegar, qué ya está registrado en DELEGACIONES.xlsx y qué falta
+- Conflictos con sweep-line (O(n log n))
+- Persistencia de estado en URL + “↺ Restablecer filtros”
 """
 import io, re, uuid, zipfile, base64, unicodedata, difflib, os, json, hashlib
 from datetime import datetime, date, time, timedelta, timezone
@@ -234,16 +235,72 @@ st.markdown(f"<div class='small'>Perfil activo: <b>{PROFILE}</b> {'💎' if IS_A
 raw = _try_load_main(_EMBED_XLSX_B64)
 df0 = normalize_cols(raw)
 
-# Limpiar marcadores delegación y flags
+# === Delegaciones (EXTRACCIÓN DE NOMBRES) ===
+def _split_people(cell):
+    if pd.isna(cell): return []
+    parts = _SEP_REGEX.split(str(cell))
+    clean = [p.strip() for p in parts if p and p.strip()]
+    out = []
+    for p in clean:
+        if " y " in p: out.extend([x.strip() for x in p.split(" y ") if x.strip()])
+        else: out.append(p)
+    return out
+
 def add_delegate_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Limpia los marcadores y deja:
+      - Requiere Delegación (bool)
+      - Delegan: cadena con los nombres que deben delegar
+      - __deleg_list: lista de nombres originales
+      - __deleg_norm_list: lista normalizada de esos nombres
+    """
     df = df.copy()
-    for col in ["Participantes", "Responsable", "Corresponsable"]:
-        if col in df.columns:
-            df[f"__flag_{col}"] = df[col].fillna("").astype(str).apply(_has_delegate_marker)
-            df[col] = df[col].fillna("").astype(str).apply(_strip_delegate_marker)
-    flags = [c for c in df.columns if c.startswith("__flag_")]
-    df["Requiere Delegación"] = df[flags].any(axis=1) if flags else False
-    df.drop(columns=flags, inplace=True, errors="ignore")
+    deleg_lists = []
+
+    for i, r in df.iterrows():
+        flagged: List[str] = []
+
+        # Responsable
+        rs = _safe_str(r.get("Responsable"))
+        if rs and _has_delegate_marker(rs):
+            flagged.append(_strip_delegate_marker(rs))
+            rs = _strip_delegate_marker(rs)
+
+        # Corresponsable
+        cs = _safe_str(r.get("Corresponsable"))
+        if cs and _has_delegate_marker(cs):
+            flagged.append(_strip_delegate_marker(cs))
+            cs = _strip_delegate_marker(cs)
+
+        # Participantes (varios)
+        ps = _safe_str(r.get("Participantes"))
+        if ps:
+            parts = _split_people(ps)
+            clean_parts = []
+            for p in parts:
+                if _has_delegate_marker(p):
+                    flagged.append(_strip_delegate_marker(p))
+                    clean_parts.append(_strip_delegate_marker(p))
+                else:
+                    clean_parts.append(p.strip())
+            ps = ", ".join([x for x in clean_parts if x])
+        # Escribimos de vuelta los campos LIMPIOS
+        if "Responsable" in df.columns: df.at[i,"Responsable"] = rs
+        if "Corresponsable" in df.columns: df.at[i,"Corresponsable"] = cs
+        if "Participantes" in df.columns: df.at[i,"Participantes"] = ps
+
+        # Guardamos lista
+        # Quitamos vacíos y preservamos orden sin duplicados
+        seen = set(); ordered = []
+        for nm in flagged:
+            nm2 = nm.strip()
+            if nm2 and nm2 not in seen:
+                seen.add(nm2); ordered.append(nm2)
+        deleg_lists.append(ordered)
+
+    df["__deleg_list"] = deleg_lists
+    df["__deleg_norm_list"] = df["__deleg_list"].apply(lambda lst: [_norm(x) for x in lst])
+    df["Delegan"] = df["__deleg_list"].apply(lambda lst: ", ".join(lst) if lst else "")
+    df["Requiere Delegación"] = df["__deleg_list"].apply(lambda lst: bool(lst))
     return df
 
 df0 = add_delegate_flags(df0)
@@ -265,16 +322,6 @@ def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
 DF = df0[df0["_fecha"].apply(_only_sep_oct_weekdays)].copy()
 
 # Index expandido (personas)
-def _split_people(cell):
-    if pd.isna(cell): return []
-    parts = _SEP_REGEX.split(str(cell))
-    clean = [p.strip() for p in parts if p and p.strip()]
-    out = []
-    for p in clean:
-        if " y " in p: out.extend([x.strip() for x in p.split(" y ") if x.strip()])
-        else: out.append(p)
-    return out
-
 def build_index(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, r in df.iterrows():
@@ -295,8 +342,9 @@ for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participa
     if col in idx.columns: idx[f"__norm_{col}"] = idx[col].fillna("").astype(str).apply(_norm)
 idx["__norm_part"] = idx["Participante_individual"].fillna("").astype(str).apply(_norm)
 
-# ========= Delegaciones 2.0 =========
+# ========= Delegaciones 2.0 (archivo) =========
 deleg_raw = _try_load_deleg(_EMBED_DELEG_B64)
+
 def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["__actor","__mesa","__fecha","__ini","__fin"])
@@ -329,6 +377,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     }).dropna(subset=["__mesa","__fecha"])
     out = out[out["__actor"].astype(bool)]
     return out
+
 deleg_map = _prepare_deleg_map(deleg_raw)
 
 def _token_subset(a: str, b: str) -> bool:
@@ -336,34 +385,31 @@ def _token_subset(a: str, b: str) -> bool:
     if not sa or not sb: return False
     return sa.issubset(sb) if len(sa) <= len(sb) else sb.issubset(sa)
 
-def annotate_delegations(idxf: pd.DataFrame, dmap: pd.DataFrame) -> pd.DataFrame:
-    idxf = idxf.copy()
-    if dmap.empty or "Mesa" not in idxf.columns:
-        idxf["__delegado_por_archivo"] = False
-        return idxf
+def _build_deleg_groups(dmap: pd.DataFrame):
     groups: Dict[Tuple[str, date], List[Tuple[str, Optional[time], Optional[time]]]] = {}
     for _, r in dmap.iterrows():
         key = (r["__mesa"], r["__fecha"])
         groups.setdefault(key, []).append((r["__actor"], r.get("__ini"), r.get("__fin")))
-    flags = []
-    for _, r in idxf.iterrows():
-        key = (_norm(_safe_str(r.get("Mesa") or r.get("Nombre de la mesa"))), r.get("_fecha"))
-        candidates = groups.get(key, [])
-        actor = _norm(r.get("Participante_individual",""))
-        ini_r, fin_r = r.get("_ini"), r.get("_fin")
-        ok_any = False
-        for cand_actor, ini_d, fin_d in candidates:
-            name_ok = (actor == cand_actor) or _token_subset(actor, cand_actor)
-            if not name_ok: continue
-            if ini_d and fin_d and ini_r and fin_r:
-                ok_any |= (max(ini_r, ini_d) < min(fin_r, fin_d))
-            else:
-                ok_any |= True
-        flags.append(ok_any)
-    idxf["__delegado_por_archivo"] = flags
-    return idxf
+    return groups
 
-idx = annotate_delegations(idx, deleg_map)
+DELEG_GROUPS = _build_deleg_groups(deleg_map)
+
+def _names_already_delegated(flagged_norms: List[str], mesa_norm: str, fecha: date,
+                             ini: Optional[time], fin: Optional[time]) -> set:
+    """Devuelve los nombres normalizados ya registrados en DELEGACIONES.xlsx para esa mesa/fecha (y horas si están)."""
+    found = set()
+    candidates = DELEG_GROUPS.get((mesa_norm, fecha), [])
+    for n in flagged_norms:
+        for actor, ini_d, fin_d in candidates:
+            name_ok = (n == actor) or _token_subset(n, actor)
+            if not name_ok: 
+                continue
+            if ini and fin and ini_d and fin_d:
+                if max(ini, ini_d) < min(fin, fin_d):
+                    found.add(n); break
+            else:
+                found.add(n); break
+    return found
 
 # ========= Fuzzy =========
 def _score(a: str, b: str) -> float:
@@ -377,7 +423,7 @@ def smart_match(series_norm: pd.Series, query: str, threshold: int = 80):
     if not q: return pd.Series([True]*len(series_norm), index=series_norm.index)
     return series_norm.apply(lambda s: _score(s, q) >= threshold)
 
-# ========= ICS seguro =========
+# ========= ICS =========
 def escape_text(val: str) -> str:
     if val is None: return ""
     v = str(val)
@@ -461,7 +507,7 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     if not all(c in df.columns for c in KEY_COLS): return df.copy()
     return df.sort_values(KEY_COLS, kind="mergesort").drop_duplicates(subset=KEY_COLS, keep="first")
 
-# ========= Utilidades de fecha para widgets (FIX) =========
+# ========= Utilidades de fecha para widgets =========
 def _parse_iso_date(s) -> Optional[date]:
     try:
         return date.fromisoformat(str(s)[:10])
@@ -512,16 +558,14 @@ if section == "Resumen":
     top_people = s.value_counts().head(10).rename_axis("Persona").reset_index(name="Conteo")
     uso_aula = DFu.groupby("Aula")["Nombre de la mesa"].count().sort_values(ascending=False).head(10).rename_axis("Aula").reset_index(name="Mesas")
     cc1, cc2 = st.columns(2)
-    with cc1: st.markdown("**Top 10 personas por participación**"); 
-    if not top_people.empty:
-        st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
-    else:
-        st.info("Sin datos de personas.")
-    with cc2: st.markdown("**Aulas más usadas (Top 10)**"); 
-    if not uso_aula.empty:
-        st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
-    else:
-        st.info("Sin datos de aulas.")
+    with cc1:
+        st.markdown("**Top 10 personas por participación**")
+        if not top_people.empty: st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=400), use_container_width=True)
+        else: st.info("Sin datos de personas.")
+    with cc2:
+        st.markdown("**Aulas más usadas (Top 10)**")
+        if not uso_aula.empty: st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=400), use_container_width=True)
+        else: st.info("Sin datos de aulas.")
 
     # Mesas por día (Lun–Vie)
     dfh = DFu.dropna(subset=["_fecha"]).copy()
@@ -539,7 +583,6 @@ elif section == "Consulta":
     with st.expander("⚙️ Filtros (Lun–Vie, Sep–Oct)", expanded=False):
         c1, c2, c3, c4 = st.columns([1,1,1,0.6])
 
-        # Rango natural de la data ya filtrada a Lun–Vie Sep–Oct
         fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
         if fechas_validas:
             dmin, dmax = min(fechas_validas), max(fechas_validas)
@@ -580,10 +623,7 @@ elif section == "Consulta":
                     if k in st.query_params: del st.query_params[k]
                 st.rerun()
 
-        # Chip informativo del rango activo
         st.caption(f"**Rango activo:** {fmin.isoformat()} → {fmax.isoformat()} · {(fmax - fmin).days + 1} días")
-
-        # Persistir estado
         set_qp(rng=(fmin.isoformat(), fmax.isoformat()),
                aulas=aula_sel, dows=dow, resp=rsel, sdel=solo_deleg)
 
@@ -907,16 +947,48 @@ elif section == "Disponibilidad":
 elif section == "Delegaciones":
     st.subheader("🛟 Reporte de Delegaciones (Lun–Vie Sep–Oct)")
     DFu = _dedup_events(DF)
-    cols = ["Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación"]
-    rep = DFu[DFu["Requiere Delegación"]==True][cols].copy()
+
+    # Filtrar solo filas que requieren delegación (por marcador en el Excel principal)
+    rep = DFu[DFu["Requiere Delegación"]==True].copy()
     if rep.empty:
         st.info("No hay mesas marcadas con 'Requiere Delegación'.")
     else:
-        rep["Fecha"] = DFu.loc[rep.index, "_fecha"].apply(lambda d: d.isoformat() if d else "")
-        st.dataframe(rep, use_container_width=True, hide_index=True)
+        # Construimos “registradas” y “pendientes” cruzando con DELEGACIONES.xlsx
+        def _row_status(r):
+            flagged = list(r.get("__deleg_list") or [])
+            flagged_norm = list(r.get("__deleg_norm_list") or [])
+            mesa_norm = _norm(r.get("Mesa") or r.get("Nombre de la mesa"))
+            fecha = r.get("_fecha")
+            ini, fin = r.get("_ini"), r.get("_fin")
+
+            already = _names_already_delegated(flagged_norm, mesa_norm, fecha, ini, fin)
+            ya_reg = [nm for nm in flagged if _norm(nm) in already]
+            pendientes = [nm for nm in flagged if _norm(nm) not in already]
+            estado = "OK" if not pendientes else f"FALTAN {len(pendientes)}"
+            return ", ".join(flagged), ", ".join(ya_reg) if ya_reg else "—", ", ".join(pendientes) if pendientes else "—", estado
+
+        rep[["Deben delegar","Delegación registrada","Pendientes por delegar","Estado"]] = rep.apply(
+            lambda r: pd.Series(_row_status(r)), axis=1
+        )
+
+        # Presentación bonita
+        out_cols = ["Nombre de la mesa","Fecha","Inicio","Fin","Aula",
+                    "Responsable","Corresponsable","Participantes",
+                    "Deben delegar","Delegación registrada","Pendientes por delegar","Estado"]
+        rep_view = rep[out_cols].copy()
+        rep_view["Fecha"] = rep["_fecha"].apply(lambda d: d.isoformat() if d else "")
+        rep_view["Inicio"] = rep["_ini"].apply(lambda t: t.strftime("%H:%M") if t else "")
+        rep_view["Fin"]    = rep["_fin"].apply(lambda t: t.strftime("%H:%M") if t else "")
+
+        st.dataframe(rep_view, use_container_width=True, hide_index=True)
+
+        # Descarga
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w: rep.to_excel(w, sheet_name="Delegaciones", index=False)
-        st.download_button("⬇️ Delegaciones (Excel)", data=buf.getvalue(), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_name="delegaciones.xlsx")
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            rep_view.to_excel(w, sheet_name="Delegaciones", index=False)
+        st.download_button("⬇️ Delegaciones (Excel)", data=buf.getvalue(),
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           file_name="delegaciones.xlsx")
 
 elif section == "Diagnóstico":
     st.subheader("🧪 Diagnóstico (Lun–Vie Sep–Oct)")
@@ -950,12 +1022,12 @@ elif section == "Diagnóstico":
 
     st.markdown("—")
     st.markdown("**Vista rápida (AAAA-MM-DD)**")
-    cols = [c for c in ["Mesa","Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación"] if c in DFu.columns]
+    cols = [c for c in ["Mesa","Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Requiere Delegación","Delegan"] if c in DFu.columns]
     quick = DFu[cols].head(30).copy()
     if "Fecha" in quick: quick["Fecha"] = DFu["_fecha"].head(30).apply(lambda d: d.isoformat() if d else "")
     st.dataframe(quick, use_container_width=True, hide_index=True)
 
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE (auditoría Weekdays-only + date_input safe)")
-    st.markdown("• Fechas `AAAA-MM-DD` estrictas\n• Sin sábado ni domingo en toda la app\n• Máscara alineada (sin IndexingError)\n• date_input con clamp seguro\n• Métricas por evento único\n• ICS robusto y conflictos O(n log n)\n")
+    st.markdown("Publicación: 13/09/2025 — INIMAGINABLE (Delegaciones visibles + auditoría Weekdays-only)")
+    st.markdown("• Fechas `AAAA-MM-DD` estrictas · Sin sábado ni domingo · Rango visible + reset · Delegaciones con pendientes y estado · ICS robusto · Conflictos O(n log n)")
