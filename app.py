@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión productiva extendida
+Planificador de Mesas y Agenda POT
 - Fechas AAAA-MM-DD, sin sábados ni domingos (Lun–Vie) y solo Sept–Oct
 - KPIs + Gráficos en Resumen
 - Vistas guardadas (shareable URL) en Consulta
