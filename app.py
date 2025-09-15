@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión productiva optimizada (FIX robusto final)
+Cronograma Mesas POT — versión productiva optimizada (FIX robusto)
 - Fechas AAAA-MM-DD, solo Lun–Vie, meses Sep–Oct
 - KPIs + gráficos (Resumen)
 - Consulta con vistas guardadas por URL (compatibilidad query params)
@@ -37,8 +37,7 @@ def _glob_candidates(prefix: str):
         f"/mnt/data/{prefix}*.xlsx", f"./data/{prefix}.xlsx", f"./data/{prefix}*.xlsx",
     ]
     out = []
-    for p in pats:
-        out.extend(glob.glob(p))
+    for p in pats: out.extend(glob.glob(p))
     seen=set(); res=[]
     for x in out:
         if x not in seen and os.path.exists(x):
@@ -48,13 +47,11 @@ def _glob_candidates(prefix: str):
 REPO_CAND_MAIN  = _glob_candidates("STREAMLIT")
 REPO_CAND_DELEG = _glob_candidates("DELEGACIONES")
 
-# Incluye explícitamente los archivos que reportaste
+# Incluye explícitamente los archivos reportados
 for p in ["/mnt/data/STREAMLIT (2).xlsx", "/mnt/data/DELEGACIONES (1).xlsx"]:
     if os.path.exists(p):
-        if "STREAMLIT" in p.upper() and p not in REPO_CAND_MAIN:
-            REPO_CAND_MAIN.append(p)
-        if "DELEGACIONES" in p.upper() and p not in REPO_CAND_DELEG:
-            REPO_CAND_DELEG.append(p)
+        if "STREAMLIT" in p.upper() and p not in REPO_CAND_MAIN: REPO_CAND_MAIN.append(p)
+        if "DELEGACIONES" in p.upper() and p not in REPO_CAND_DELEG: REPO_CAND_DELEG.append(p)
 
 try:
     from zoneinfo import ZoneInfo
@@ -62,57 +59,58 @@ try:
 except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
-# ========= Compatibilidad Query Params (Streamlit ≥1.32 y previas) =========
+# ========= Compatibilidad Query Params =========
 def _qp_get_all():
-    try:
-        return dict(st.query_params)
+    try: return dict(st.query_params)
     except Exception:
-        try:
-            return st.experimental_get_query_params()
-        except Exception:
-            return {}
+        try: return st.experimental_get_query_params()
+        except Exception: return {}
 
 def _qp_get(key, default=None):
     qs = _qp_get_all()
     if key not in qs: return default
     v = qs[key]
-    if isinstance(v, list):
-        return v[0] if v else default
+    if isinstance(v, list): return v[0] if v else default
     return v
 
 def _qp_set(mapping: Dict[str, object]):
     m = {}
     for k, v in mapping.items():
-        if v is None:
-            continue
+        if v is None: continue
         if isinstance(v, (list, tuple, dict)):
             m[k] = json.dumps(v, ensure_ascii=False)
         else:
             m[k] = str(v)
-    try:
-        st.query_params.update(m)  # >=1.32
+    try: st.query_params.update(m)  # >=1.32
     except Exception:
         try:
             base = _qp_get_all(); base.update(m)
             st.experimental_set_query_params(**base)
-        except Exception:
-            pass
+        except Exception: pass
 
 def _qp_del(keys: List[str]):
     cur = _qp_get_all()
-    for k in keys:
-        cur.pop(k, None)
-    # set directo, sin .clear()
-    try:
-        st.query_params.update(cur)
+    for k in keys: cur.pop(k, None)
+    try: st.query_params.update(cur)
     except Exception:
-        try:
-            st.experimental_set_query_params(**cur)
-        except Exception:
-            pass
+        try: st.experimental_set_query_params(**cur)
+        except Exception: pass
+
+def _qp_update_if_changed(mapping: Dict[str, object]):
+    """Actualiza st.query_params SOLO si el valor stringificado cambió (evita reruns innecesarios)."""
+    cur = _qp_get_all()
+    to_set = {}
+    for k, v in mapping.items():
+        new_v = json.dumps(v, ensure_ascii=False) if isinstance(v,(list,tuple,dict)) else str(v)
+        cur_v = cur.get(k, None)
+        cur_v = cur_v[0] if isinstance(cur_v, list) and cur_v else cur_v
+        if str(cur_v) != new_v:
+            to_set[k] = v
+    if to_set:
+        _qp_set(to_set)
 
 # ========= UI base =========
-st.set_page_config(page_title="Mesas · INIMAGINABLE", page_icon="🗂️",
+st.set_page_config(page_title="Cronograma Mesas POT", page_icon="🗂️",
                    layout="wide", initial_sidebar_state="expanded")
 
 def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
@@ -302,34 +300,47 @@ def _try_load_deleg(embed_b64: str):
             continue
     return pd.DataFrame()
 
-# ========= UI lateral =========
-if "dark" not in st.session_state: st.session_state.dark = True
+# ========= Sidebar (estado estable + URL delta-aware) =========
+if "dark" not in st.session_state:
+    st.session_state.dark = True
+
+options_sections = ["Resumen","Consulta","Agenda","Gantt","Heatmap","Conflictos",
+                    "Disponibilidad","Delegaciones","Calidad","Diferencias",
+                    "Recomendador","Diagnóstico","Acerca de"]
+
+if "sec" not in st.session_state:
+    sec_from_url = _qp_get("sec", "Resumen")
+    st.session_state.sec = sec_from_url if sec_from_url in options_sections else "Resumen"
+
 with st.sidebar:
     st.session_state.dark = st.checkbox("Modo oscuro", value=st.session_state.dark)
-    options_sections = ["Resumen","Consulta","Agenda","Gantt","Heatmap","Conflictos",
-                        "Disponibilidad","Delegaciones","Calidad","Diferencias",
-                        "Recomendador","Diagnóstico","Acerca de"]
-    sec_default = _qp_get("sec", "Resumen")
+
+    section = st.radio(
+        "Sección",
+        options_sections,
+        index=options_sections.index(st.session_state.sec),
+        key="sec"
+    )
+
     try:
-        idx_default = max(0, options_sections.index(sec_default))
+        shade_from_url = float(_qp_get("shade", "0.75"))
     except Exception:
-        idx_default = 0
-    section = st.radio("Sección", options_sections, index=idx_default)
-    try:
-        ui_dark = float(_qp_get("shade", "0.75"))
-    except Exception:
-        ui_dark = 0.75
-    ui_dark = st.slider("Intensidad fondo", 0.0, 1.0, ui_dark, 0.05)
+        shade_from_url = 0.75
+    ui_dark = st.slider("Intensidad fondo", 0.0, 1.0, shade_from_url, 0.05)
+
     dens_default = _qp_get("dens","compacta")
     densidad = st.select_slider("Densidad tabla", options=["compacta","media","amplia"], value=dens_default)
-    _qp_set({"shade": ui_dark, "dens": densidad, "sec": section})
+
     st.markdown("### 📦 Datos")
     st.file_uploader("STREAMLIT.xlsx",    type=["xlsx"], key="upload_main")
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
 
+# Actualiza la URL solo si cambió
+_qp_update_if_changed({"shade": ui_dark, "dens": densidad, "sec": st.session_state.sec})
+
 inject_base_css(st.session_state.dark, ui_dark, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Mesas · INIMAGINABLE</h1>", unsafe_allow_html=True)
+st.markdown("<h1 class='gradient-title'>🗂️ Cronograma Mesas POT</h1>", unsafe_allow_html=True)
 st.caption("Omnibox • Weekdays-only • Delegaciones desde archivo (vectorizado) • Conflictos sweep-line • Exportes completos")
 
 # ========= Perfiles por URL =========
@@ -458,7 +469,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({
         "__actor":     raw_actor.map(_norm),
         "__actor_raw": raw_actor,
-        "__mesa":      df[col_mesa].astype(str).map(_norm_mesa_code),  # <— normalizado
+        "__mesa":      df[col_mesa].astype(str).map(_norm_mesa_code),
         "__fecha":     pd.to_datetime(df[col_fecha], errors="coerce").dt.date,
         "__ini":       df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else None,
         "__fin":       df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else None
@@ -478,7 +489,7 @@ def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> p
         out = idxf.copy(); out["__delegado_por_archivo"] = False; return out
     ev = idxf[["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participante_individual"]].copy()
     ev["ev_idx"]     = ev.index
-    ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)  # <— normalizado
+    ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)
     ev["actor_norm"] = ev["Participante_individual"].fillna("").astype(str).map(_norm)
     def t2m(t):
         if pd.isna(t) or t is None: return np.nan
@@ -542,10 +553,10 @@ def dt_ics_utc(dt):
         except Exception: pass
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-def build_ics(rows: pd.DataFrame, calendar_name="Mesas"):
+def build_ics(rows: pd.DataFrame, calendar_name="Cronograma Mesas POT"):
     now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
-        "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Planificador de Mesas//ES",
+        "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Cronograma Mesas POT//ES",
         "CALSCALE:GREGORIAN","METHOD:PUBLISH",
         _fold_ical_line(f"X-WR-CALNAME:{escape_text(calendar_name)}"),
         "X-WR-TIMEZONE:America/Bogota",
@@ -580,6 +591,7 @@ if c_omni:
 st.divider()
 
 # ========= Secciones =========
+section = st.session_state.sec
 KEY_COLS = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
 
 if DF.empty:
@@ -692,10 +704,8 @@ elif section == "Consulta":
         with c2:
             aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
             def _get_json(k, default):
-                try:
-                    return json.loads(_qp_get(k)) if _qp_get(k) else default
-                except Exception:
-                    return default
+                try: return json.loads(_qp_get(k)) if _qp_get(k) else default
+                except Exception: return default
             aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas,
                                       default=_get_json("aulas",["(todas)"]), key="consulta_aulas")
             dow_opts = ["Lun","Mar","Mié","Jue","Vie"]
@@ -719,8 +729,10 @@ elif section == "Consulta":
                 st.rerun()
 
         st.caption(f"**Rango activo:** {fmin.isoformat()} → {fmax.isoformat()} · {(fmax - fmin).days + 1} días")
-        _qp_set({"rng": (fmin.isoformat(), fmax.isoformat()), "aulas": aula_sel, "dows": dow,
-                 "resp": rsel, "sdel": solo_deleg})
+        _qp_update_if_changed({
+            "rng": (fmin.isoformat(), fmax.isoformat()),
+            "aulas": aula_sel, "dows": dow, "resp": rsel, "sdel": solo_deleg
+        })
 
     # Vistas guardadas
     with st.expander("💾 Vistas guardadas"):
@@ -728,7 +740,7 @@ elif section == "Consulta":
             payload = {"rng": (fmin.isoformat(), fmax.isoformat()),
                        "aulas": aula_sel, "dows": dow, "resp": rsel,
                        "sdel": solo_deleg, "q": _qp_get("q","")}
-            _qp_set({"view": base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")})
+            _qp_update_if_changed({"view": base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")})
             st.success("Vista guardada en la URL. Copia y compártela.")
         vw = _qp_get("view")
         if vw:
@@ -745,7 +757,7 @@ elif section == "Consulta":
     term = (st.selectbox("Participante", options=[""]+people, index=0, key="consulta_part")
             if modo=="Seleccionar" else
             st.text_input("Escriba parte del nombre", value=_qp_get("q",""), key="consulta_term"))
-    _qp_set({"q": term})
+    _qp_update_if_changed({"q": term})
 
     # Máscara vectorizada
     mask = pd.Series(True, index=idx.index, dtype=bool)
@@ -804,7 +816,7 @@ elif section == "Consulta":
         st.download_button("Excel (filtro)", data=xls_buf.getvalue(),
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            file_name="resultados.xlsx")
-        st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name="Mesas"),
+        st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name="Cronograma Mesas POT"),
                            mime="text/calendar", file_name="mesas.ics")
 
 # ---------------- Agenda ----------------
@@ -866,7 +878,6 @@ elif section == "Heatmap":
         if piv.empty:
             st.info("No hay datos para el heatmap.")
         else:
-            # conversión segura por si viene object
             try: piv = piv.astype(int)
             except Exception: pass
             fig = px.imshow(piv, aspect="auto", labels=dict(color="Mesas"))
@@ -887,7 +898,7 @@ elif section == "Conflictos":
         try: gap_default = int(gap_qp)
         except Exception: gap_default = 10
         brecha = int(st.slider("Brecha mínima (min)", 0, 60, gap_default))
-    _qp_set({"applydel":aplicar_deleg, "gap":brecha})
+    _qp_update_if_changed({"applydel":aplicar_deleg, "gap":brecha})
 
     def overlaps(events: List[Dict], gap_min=0):
         evs = sorted(events, key=lambda e: (e["start"], e["end"]))
@@ -1114,8 +1125,7 @@ elif section == "Recomendador":
         s = combine_dt(r["_fecha"], r["_ini"]); e = combine_dt(r["_fecha"], r["_fin"])
         if s and e:
             busy_by_room.setdefault(_norm(_safe_str(r.get("Aula",""))), []).append((s,e))
-    for k in list(busy_by_room.keys()):
-        busy_by_room[k] = sorted(busy_by_room[k])
+    for k in list(busy_by_room.keys()): busy_by_room[k] = sorted(busy_by_room[k])
 
     def overlaps_list(win: Tuple[datetime,datetime], intervals: List[Tuple[datetime,datetime]]) -> int:
         s, e = win; return sum(1 for a,b in intervals if max(s,a) < min(e,b))
@@ -1203,4 +1213,4 @@ elif section == "Diagnóstico":
 # ---------------- Acerca de ----------------
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 2025-09-15 — INIMAGINABLE Optimizado (normalizador de mesas, lecturas flexibles, fixes de cache y delegaciones)")
+    st.markdown("Publicación: 2025-09-15 — Cronograma Mesas POT (normalizador de mesas, lecturas flexibles, fixes de cache, navegación estable y delegaciones)")
