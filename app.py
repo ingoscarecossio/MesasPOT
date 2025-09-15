@@ -3,7 +3,7 @@
 Mesas · INIMAGINABLE — versión productiva optimizada (FIX robusto)
 - Fechas AAAA-MM-DD, solo Lun–Vie, meses Sep–Oct
 - KPIs + gráficos (Resumen)
-- Consulta con vistas guardadas por URL (compatibilidad query params)
+- Consulta con vistas guardadas por URL (compatibilidad query params).
 - Delegaciones desde DELEGACIONES.xlsx (columna 'actor') — cálculo vectorizado
 - Conflictos sweep-line, exportes ICS/CSV/XLSX
 - Panel de Calidad, Diferencias entre archivos, Recomendador
