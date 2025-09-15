@@ -2,7 +2,7 @@
 """
 Cronograma Mesas POT — versión optimizada (rendimiento + estabilidad)
 - Carga de Excel cacheada por hash (upload/embebido/disk)
-- Lazy index y delegaciones (se calculan solo cuando se usan)
+- Lazy index y delegaciones (se calculan solo cuando se usan.)
 - Omnibox con botón Buscar (debounce)
 - Modo ligero para datasets grandes (evita gráficos costosos antes de filtrar)
 - Fix navegación (URL delta-aware + session_state)
