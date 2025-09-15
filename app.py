@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión productiva optimizada (FIX robusto)
+Mesas · INIMAGINABLE — versión productiva optimizada (FIX robusto final)
 - Fechas AAAA-MM-DD, solo Lun–Vie, meses Sep–Oct
 - KPIs + gráficos (Resumen)
-- Consulta con vistas guardadas por URL (compatibilidad query params).
+- Consulta con vistas guardadas por URL (compatibilidad query params)
 - Delegaciones desde DELEGACIONES.xlsx (columna 'actor') — cálculo vectorizado
 - Conflictos sweep-line, exportes ICS/CSV/XLSX
 - Panel de Calidad, Diferencias entre archivos, Recomendador
-- Cachés y joins vectorizados para performance
+- Cachés ligeras (solo en derivados); carga de archivos SIN cache pegajoso
 - Manejo robusto de datos vacíos, tipos y combinaciones fecha/hora
 """
 
@@ -21,30 +21,24 @@ import plotly.express as px
 import streamlit as st
 
 # ========= Embebidos opcionales =========
-_EMBED_XLSX_B64 = ""        # STREAMLIT.xlsx (hoja “Calendario” o primera)
+_EMBED_XLSX_B64 = ""        # STREAMLIT.xlsx (hoja candidata)
 _EMBED_DELEG_B64 = ""       # DELEGACIONES.xlsx (primera hoja)
 _BG_B64 = ""                # Imagen de fondo (base64) opcional
-_SHEET_CANDIDATES = ["Calendario", "Agenda", "Programación"]
+_SHEET_CANDIDATES = ["Calendario", "Agenda", "Programación", "Calendario_Mesas"]
 
 # ========= Config & rutas repo =========
 _DELEG_MARKER_REGEX = re.compile(r"\(\s*no disponible\s*,\s*asignar delegado\s*\)", re.IGNORECASE)
 _SEP_REGEX = re.compile(r"[;,/]|\n|\r|\t|\||\u2022|·")
 
-# Soporte a nombres con sufijos "(1).xlsx" etc. en /mnt/data y raíz
+# Buscador de rutas: soporta sufijos "(1).xlsx", "(2).xlsx", etc.
 def _glob_candidates(prefix: str):
     pats = [
-        f"{prefix}.xlsx",
-        f"./{prefix}.xlsx",
-        f"/mnt/data/{prefix}.xlsx",
-        f"/mnt/data/{prefix} (*.xlsx)",  # poco común
-        f"/mnt/data/{prefix}*.xlsx",
-        f"./data/{prefix}.xlsx",
-        f"./data/{prefix}*.xlsx",
+        f"{prefix}.xlsx", f"./{prefix}.xlsx", f"/mnt/data/{prefix}.xlsx",
+        f"/mnt/data/{prefix}*.xlsx", f"./data/{prefix}.xlsx", f"./data/{prefix}*.xlsx",
     ]
     out = []
     for p in pats:
         out.extend(glob.glob(p))
-    # Únicos, preservando orden
     seen=set(); res=[]
     for x in out:
         if x not in seen and os.path.exists(x):
@@ -54,7 +48,7 @@ def _glob_candidates(prefix: str):
 REPO_CAND_MAIN  = _glob_candidates("STREAMLIT")
 REPO_CAND_DELEG = _glob_candidates("DELEGACIONES")
 
-# Incluye explícitamente archivos con espacios como los del pantallazo
+# Incluye explícitamente los archivos que reportaste
 for p in ["/mnt/data/STREAMLIT (2).xlsx", "/mnt/data/DELEGACIONES (1).xlsx"]:
     if os.path.exists(p):
         if "STREAMLIT" in p.upper() and p not in REPO_CAND_MAIN:
@@ -68,7 +62,7 @@ try:
 except Exception:
     TZ_DEFAULT = timezone(timedelta(hours=-5))
 
-# ========= Compatibilidad Query Params (Streamlit >=1.32 y previas) =========
+# ========= Compatibilidad Query Params (Streamlit ≥1.32 y previas) =========
 def _qp_get_all():
     try:
         return dict(st.query_params)
@@ -82,13 +76,11 @@ def _qp_get(key, default=None):
     qs = _qp_get_all()
     if key not in qs: return default
     v = qs[key]
-    # En versiones nuevas es str; en antiguas es list[str]
     if isinstance(v, list):
         return v[0] if v else default
     return v
 
 def _qp_set(mapping: Dict[str, object]):
-    # Normaliza a strings
     m = {}
     for k, v in mapping.items():
         if v is None:
@@ -101,9 +93,7 @@ def _qp_set(mapping: Dict[str, object]):
         st.query_params.update(m)  # >=1.32
     except Exception:
         try:
-            # Sobrescribe todo el dict
-            base = _qp_get_all()
-            base.update(m)
+            base = _qp_get_all(); base.update(m)
             st.experimental_set_query_params(**base)
         except Exception:
             pass
@@ -112,8 +102,8 @@ def _qp_del(keys: List[str]):
     cur = _qp_get_all()
     for k in keys:
         cur.pop(k, None)
+    # set directo, sin .clear()
     try:
-        st.query_params.clear()
         st.query_params.update(cur)
     except Exception:
         try:
@@ -158,7 +148,7 @@ def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "comp
     """, unsafe_allow_html=True)
 
 # ========= Utilidades =========
-def _safe_str(x): 
+def _safe_str(x):
     try:
         return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x).strip()
     except Exception:
@@ -173,6 +163,20 @@ def _norm(s: str) -> str:
 def _strip_delegate_marker(s: str) -> str:
     if not s: return s
     return _DELEG_MARKER_REGEX.sub("", s).strip()
+
+# --- Normalizador de código de mesa ---
+_MESA_RX_PAD   = re.compile(r'^\s*M\s*-\s*(\d+)\s*-\s*(\d+)\s*$', re.I)   # M-3-3
+_MESA_RX_SNUM  = re.compile(r'^\s*M\s*(\d+)\s*-\s*(\d+)\s*$', re.I)       # M23-1 -> M23-S1
+_MESA_RX_S     = re.compile(r'^\s*M\s*(\d+)\s*-\s*S\s*(\d+)\s*$', re.I)   # M23-S1 (OK)
+def _norm_mesa_code(x: str) -> str:
+    s = _safe_str(x).upper().replace(" ", "")
+    m = _MESA_RX_PAD.match(s)
+    if m: return f"M{m.group(1)}-S{m.group(2)}"
+    m = _MESA_RX_S.match(s)
+    if m: return f"M{m.group(1)}-S{m.group(2)}"
+    m = _MESA_RX_SNUM.match(s)
+    if m: return f"M{m.group(1)}-S{m.group(2)}"
+    return s
 
 COLUMN_ALIASES = {
     "Mesa": ["Mesa", "N° Mesa", "No Mesa", "Numero Mesa", "Número Mesa"],
@@ -208,7 +212,6 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
         mapping[col] = canonical
     return df.rename(columns=mapping)
 
-# Fechas AAAA-MM-DD
 def _to_date(x):
     if isinstance(x, date) and not isinstance(x, datetime): return x
     if isinstance(x, datetime): return x.date()
@@ -256,7 +259,7 @@ def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
         df.drop(columns=["_Fecha_dt","_Inicio_t"], inplace=True, errors="ignore")
     return df
 
-# ========= Carga de datos =========
+# ========= Carga de datos (SIN @st.cache_data para evitar caché pegajoso) =========
 def _read_excel_from_bytes(data: bytes, sheet_candidates=None) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(data))
     sheet = None
@@ -266,44 +269,37 @@ def _read_excel_from_bytes(data: bytes, sheet_candidates=None) -> pd.DataFrame:
     if sheet is None: sheet = xls.sheet_names[0]
     return xls.parse(sheet)
 
-@st.cache_data(show_spinner=False)
 def _try_load_main(embed_b64: str):
-    # 1) Upload en sesión
     if "upload_main" in st.session_state and st.session_state.upload_main is not None:
         return pd.ExcelFile(st.session_state.upload_main).parse(0)
-    # 2) Embebido
     if embed_b64:
         raw = base64.b64decode(embed_b64.encode("utf-8"))
         return _read_excel_from_bytes(raw, _SHEET_CANDIDATES)
-    # 3) Disco (incluye variantes con (2).xlsx)
     for path in REPO_CAND_MAIN:
         try:
             if os.path.exists(path):
                 xls = pd.ExcelFile(path)
-                sheet = "Calendario" if "Calendario" in xls.sheet_names else xls.sheet_names[0]
-                return xls.parse(sheet)
+                for cand in _SHEET_CANDIDATES:
+                    if cand in xls.sheet_names:
+                        return xls.parse(cand)
+                return xls.parse(xls.sheet_names[0])
         except Exception:
             continue
     st.error("No se encontró el Excel principal. Carga **STREAMLIT.xlsx** (o variantes) o usa la versión embebida.")
     st.stop()
 
-@st.cache_data(show_spinner=False)
 def _try_load_deleg(embed_b64: str):
-    # 1) Upload en sesión
     if "upload_deleg" in st.session_state and st.session_state.upload_deleg is not None:
         return pd.ExcelFile(st.session_state.upload_deleg).parse(0)
-    # 2) Embebido
     if embed_b64:
         raw = base64.b64decode(embed_b64.encode("utf-8"))
         return _read_excel_from_bytes(raw, None)
-    # 3) Disco
     for path in REPO_CAND_DELEG:
         try:
             if os.path.exists(path):
                 return pd.ExcelFile(path).parse(0)
         except Exception:
             continue
-    # 4) Vacío permitido
     return pd.DataFrame()
 
 # ========= UI lateral =========
@@ -319,7 +315,10 @@ with st.sidebar:
     except Exception:
         idx_default = 0
     section = st.radio("Sección", options_sections, index=idx_default)
-    ui_dark = float(_qp_get("shade", "0.75"))
+    try:
+        ui_dark = float(_qp_get("shade", "0.75"))
+    except Exception:
+        ui_dark = 0.75
     ui_dark = st.slider("Intensidad fondo", 0.0, 1.0, ui_dark, 0.05)
     dens_default = _qp_get("dens","compacta")
     densidad = st.select_slider("Densidad tabla", options=["compacta","media","amplia"], value=dens_default)
@@ -364,24 +363,22 @@ def clean_delegate_markers(df: pd.DataFrame) -> pd.DataFrame:
 
 df0 = clean_delegate_markers(df0)
 
-# Precalcular campos y tipos (con defensas)
+# Precalcular campos y tipos
 df0["_fecha"] = df0["Fecha"].apply(_to_date)
 df0["_ini"]   = df0["Inicio"].apply(_to_time)
 df0["_fin"]   = df0["Fin"].apply(_to_time)
 
-# Columnas string normalizadas – solo si existen
+# Normalizados
 for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la mesa","Mesa"]:
     if col in df0.columns:
         df0[col] = df0[col].astype(str)
         df0[f"__norm_{col}"] = df0[col].fillna("").astype(str).map(_norm)
 
-# Acelera filtros por igualdad, usando category cuando aplique
+# Categories
 for cat_col in ["Aula","Responsable","Corresponsable"]:
     if cat_col in df0.columns:
-        try:
-            df0[cat_col] = df0[cat_col].astype("category")
-        except Exception:
-            pass
+        try: df0[cat_col] = df0[cat_col].astype("category")
+        except Exception: pass
 
 df0 = ensure_sorted(df0)
 
@@ -390,7 +387,6 @@ def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
 def _only_sep_oct_weekdays(d: Optional[date]) -> bool: 
     return _is_weekday(d) and (d.month in (9,10))
-
 DF = df0[df0["_fecha"].map(_only_sep_oct_weekdays)].copy()
 
 @st.cache_data(show_spinner=False)
@@ -403,7 +399,7 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         return df.copy()
 
-# Índice expandido (personas) — caché
+# Índice expandido (personas)
 @st.cache_data(show_spinner=False)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -462,7 +458,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({
         "__actor":     raw_actor.map(_norm),
         "__actor_raw": raw_actor,
-        "__mesa":      df[col_mesa].astype(str).map(_norm),
+        "__mesa":      df[col_mesa].astype(str).map(_norm_mesa_code),  # <— normalizado
         "__fecha":     pd.to_datetime(df[col_fecha], errors="coerce").dt.date,
         "__ini":       df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else None,
         "__fin":       df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else None
@@ -479,13 +475,11 @@ deleg_map = _prepare_deleg_map(deleg_raw)
 @st.cache_data(show_spinner=False)
 def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> pd.DataFrame:
     if dmap is None or dmap.empty or idxf is None or idxf.empty:
-        out = idxf.copy()
-        out["__delegado_por_archivo"] = False
-        return out
+        out = idxf.copy(); out["__delegado_por_archivo"] = False; return out
     ev = idxf[["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participante_individual"]].copy()
-    ev["ev_idx"]    = ev.index
-    ev["mesa_norm"] = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm)
-    ev["actor_norm"]= ev["Participante_individual"].fillna("").astype(str).map(_norm)
+    ev["ev_idx"]     = ev.index
+    ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)  # <— normalizado
+    ev["actor_norm"] = ev["Participante_individual"].fillna("").astype(str).map(_norm)
     def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
@@ -503,7 +497,6 @@ def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> p
     ini_d_f = np.where(np.isnan(ini_d), -1,    ini_d)
     fin_d_f = np.where(np.isnan(fin_d),  1e9,  fin_d)
     overlap = has_ev_time & (np.maximum(ini_ev, ini_d_f) < np.minimum(fin_ev, fin_d_f))
-    # Si delegación no tiene horas, también cuenta (matcheo por mesa/fecha/actor)
     no_hours = np.isnan(ini_d) & np.isnan(fin_d) & has_ev_time
     merged["__flag"] = overlap | no_hours
     flags = merged.groupby("ev_idx")["__flag"].any().reindex(idxf.index, fill_value=False)
@@ -563,7 +556,7 @@ def build_ics(rows: pd.DataFrame, calendar_name="Mesas"):
         if f is None or t is None: continue
         nombre_mesa = _safe_str(r.get("Nombre de la mesa"))
         aula = _safe_str(r.get("Aula"))
-        raw_uid = f"{nombre_mesa}|{_to_date(r.get('Fecha'))}|{_to_time(r.get('Inicio'))}|{aula}"
+        raw_uid = f"{_norm_mesa_code(r.get('Mesa') or nombre_mesa)}|{_to_date(r.get('Fecha'))}|{_to_time(r.get('Inicio'))}|{aula}"
         uid = hashlib.sha1(raw_uid.encode("utf-8")).hexdigest() + "@mesas.local"
         lines += [
             "BEGIN:VEVENT",
@@ -589,18 +582,14 @@ st.divider()
 # ========= Secciones =========
 KEY_COLS = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
 
-# Ayuda: si DF está vacío, avisamos (no detenemos la app)
 if DF.empty:
     st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
-
-section = section  # ya viene del sidebar
 
 # ---------------- Resumen ----------------
 if section == "Resumen":
     st.subheader("📈 Resumen ejecutivo (Lun–Vie, Sep–Oct)")
     DFu = _dedup_events(DF)
 
-    # KPIs
     def make_stats(df):
         base = _dedup_events(df)
         n_mesas = base.shape[0]
@@ -619,7 +608,6 @@ if section == "Resumen":
     with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
     with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
-    # Gráficos
     all_people = []
     for v in DFu["Participantes"].fillna("").astype(str).tolist(): 
         all_people += _split_people(v)
@@ -636,7 +624,6 @@ if section == "Resumen":
             st.plotly_chart(fig1, use_container_width=True)
         else:
             st.info("Sin datos.")
-
     with c6:
         st.markdown("**Aulas más usadas (Top 10)**")
         if not uso_aula.empty:
@@ -703,7 +690,7 @@ elif section == "Consulta":
             horas = st.slider("Rango de horas", 0, 23, (6, 20), key="consulta_horas")
 
         with c2:
-            aulas = sorted(DF["Aula"].dropna().astype(str).unique().tolist()) if "Aula" in DF else []
+            aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
             def _get_json(k, default):
                 try:
                     return json.loads(_qp_get(k)) if _qp_get(k) else default
@@ -718,7 +705,7 @@ elif section == "Consulta":
             dow = [d for d in dow if d in dow_opts]
 
         with c3:
-            responsables = sorted(DF["Responsable"].dropna().astype(str).unique().tolist()) if "Responsable" in DF else []
+            responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
             rsel = st.multiselect("Responsables", responsables,
                                   default=_get_json("resp",[]), key="consulta_resp")
             sdel_default = _qp_get("sdel","false").lower() in ("true","1","yes")
@@ -879,6 +866,9 @@ elif section == "Heatmap":
         if piv.empty:
             st.info("No hay datos para el heatmap.")
         else:
+            # conversión segura por si viene object
+            try: piv = piv.astype(int)
+            except Exception: pass
             fig = px.imshow(piv, aspect="auto", labels=dict(color="Mesas"))
             fig.update_layout(height=500, margin=dict(l=10,r=10,t=30,b=20))
             st.plotly_chart(fig, use_container_width=True)
@@ -975,14 +965,16 @@ elif section == "Delegaciones":
     DFu = _dedup_events(DF).copy()
 
     def _actors_for_event_batch(df_events: pd.DataFrame) -> pd.DataFrame:
-        if df_events is None or df_events.empty:
-            return pd.DataFrame(columns=list(df_events.columns)+["Deben delegar"]) if df_events is not None else pd.DataFrame()
+        if df_events is None:
+            return pd.DataFrame()
+        if df_events.empty:
+            out = df_events.copy(); out["Deben delegar"] = []
+            return out
         ev = df_events[["_fecha","_ini","_fin","Nombre de la mesa","Mesa"]].copy()
-        ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm)
+        ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)
         merged = ev.merge(deleg_map, left_on=["mesa_norm","_fecha"], right_on=["__mesa","__fecha"], how="left")
         if merged.empty:
-            df = df_events.copy()
-            df["Deben delegar"] = [[] for _ in range(len(df))]
+            df = df_events.copy(); df["Deben delegar"] = [[] for _ in range(len(df))]
             return df
         def t2m(t):
             if pd.isna(t) or t is None: return np.nan
@@ -1002,7 +994,10 @@ elif section == "Delegaciones":
         return out
 
     rep = _actors_for_event_batch(DFu)
-    rep = rep[rep["Deben delegar"].map(len)>0].copy()
+    if rep is None or rep.empty:
+        rep = pd.DataFrame(columns=list(DFu.columns) + ["Deben delegar"])
+
+    rep = rep[rep["Deben delegar"].map(len)>0] if not rep.empty else rep
 
     if rep.empty:
         st.info("No hay delegaciones registradas en **DELEGACIONES.xlsx** para las mesas/fechas cargadas.")
@@ -1056,7 +1051,7 @@ elif section == "Calidad":
     # Reconciliación de Delegaciones (sin mesa/fecha correspondiente)
     st.subheader("🔎 Reconciliación Delegaciones")
     if not DF.empty and not deleg_map.empty:
-        m_norm = DF["Mesa"].fillna(DF["Nombre de la mesa"]).astype(str).map(_norm)
+        m_norm = DF["Mesa"].fillna(DF["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)
         k_ev = set(zip(m_norm, DF["_fecha"]))
         no_match = deleg_map[~deleg_map.apply(lambda r: (r["__mesa"], r["__fecha"]) in k_ev, axis=1)]
         if not no_match.empty:
@@ -1208,4 +1203,4 @@ elif section == "Diagnóstico":
 # ---------------- Acerca de ----------------
 else:
     st.subheader("ℹ️ Acerca de")
-    st.markdown("Publicación: 2025-09-13 — INIMAGINABLE Optimizado (delegaciones vectorizadas, cachés y filtros rápidos)")
+    st.markdown("Publicación: 2025-09-15 — INIMAGINABLE Optimizado (normalizador de mesas, lecturas flexibles, fixes de cache y delegaciones)")
