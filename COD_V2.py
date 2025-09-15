@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Cronograma Mesas POT — versión optimizada (rendimiento + estabilidad)
-- Carga de Excel cacheada por hash (upload/embebido/disk)
-- Lazy index y delegaciones (se calculan solo cuando se usan.)
+Cronograma Mesas POT — versión optimizada, auditada y robusta (rendimiento + estabilidad)
+- Carga de Excel cacheada por hash (upload/embebido/disk) con prefijo limpiado (FIX FileNotFoundError)
+- Lazy index y delegaciones (solo cuando se usan)
 - Omnibox con botón Buscar (debounce)
 - Modo ligero para datasets grandes (evita gráficos costosos antes de filtrar)
-- Fix navegación (URL delta-aware + session_state)
+- Navegación estable (URL delta-aware + session_state) compatible con Streamlit >=1.30 y anteriores
 - Límite de filas visibles en tablas (exportes completos)
+- Sección Diagnóstico ampliada (rutas, hojas, dependencias, tamaños, memoria aprox)
 """
 
-import io, re, base64, unicodedata, difflib, os, json, hashlib, glob
+import io, re, base64, unicodedata, difflib, os, json, hashlib, glob, sys, gc
 from datetime import datetime, date, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -34,7 +35,8 @@ def _glob_candidates(prefix: str):
         f"/mnt/data/{prefix}*.xlsx", f"./data/{prefix}.xlsx", f"./data/{prefix}*.xlsx",
     ]
     out = []
-    for p in pats: out.extend(glob.glob(p))
+    for p in pats:
+        out.extend(glob.glob(p))
     seen=set(); res=[]
     for x in out:
         if x not in seen and os.path.exists(x):
@@ -58,10 +60,13 @@ except Exception:
 
 # ========= Query Params helpers (compat + delta-aware) =========
 def _qp_get_all():
-    try: return dict(st.query_params)
+    try:
+        return dict(st.query_params)
     except Exception:
-        try: return st.experimental_get_query_params()
-        except Exception: return {}
+        try:
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
 
 def _qp_get(key, default=None):
     qs = _qp_get_all()
@@ -78,20 +83,25 @@ def _qp_set(mapping: Dict[str, object]):
             m[k] = json.dumps(v, ensure_ascii=False)
         else:
             m[k] = str(v)
-    try: st.query_params.update(m)  # >=1.32
+    try:
+        st.query_params.update(m)  # >=1.32
     except Exception:
         try:
             base = _qp_get_all(); base.update(m)
             st.experimental_set_query_params(**base)
-        except Exception: pass
+        except Exception:
+            pass
 
 def _qp_del(keys: List[str]):
     cur = _qp_get_all()
     for k in keys: cur.pop(k, None)
-    try: st.query_params.update(cur)
+    try:
+        st.query_params.update(cur)
     except Exception:
-        try: st.experimental_set_query_params(**cur)
-        except Exception: pass
+        try:
+            st.experimental_set_query_params(**cur)
+        except Exception:
+            pass
 
 def _qp_update_if_changed(mapping: Dict[str, object]):
     cur = _qp_get_all()
@@ -183,6 +193,7 @@ COLUMN_ALIASES = {
     "Corresponsable": ["Corresponsable", "Co-responsable", "Co Responsable"],
     "Delegaciones": ["Delegaciones", "Delegation", "Delegado"],
 }
+
 def find_col(df: pd.DataFrame, canonical: str):
     aliases = COLUMN_ALIASES.get(canonical, [canonical])
     for a in aliases:
@@ -191,6 +202,7 @@ def find_col(df: pd.DataFrame, canonical: str):
     for a in aliases:
         if a.lower() in cols_low: return cols_low[a.lower()]
     return None
+
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {}
     for canonical in COLUMN_ALIASES.keys():
@@ -250,7 +262,7 @@ def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
         df.drop(columns=["_Fecha_dt","_Inicio_t"], inplace=True, errors="ignore")
     return df
 
-# ========= Cache por hash de archivo =========
+# ========= Cache por hash de archivo (FIX incluido) =========
 def _file_hash(file_obj_or_path) -> str:
     h = hashlib.sha1()
     if hasattr(file_obj_or_path, "read"):  # UploadedFile
@@ -264,20 +276,53 @@ def _file_hash(file_obj_or_path) -> str:
                 h.update(chunk)
     return h.hexdigest()
 
+def _strip_cache_prefix(key_or_path: str) -> str:
+    """Convierte 'path_main::/x.xlsx' -> '/x.xlsx'. Si ya es path normal, lo deja igual."""
+    if not isinstance(key_or_path, str):
+        return key_or_path
+    if "::" in key_or_path:
+        return key_or_path.split("::", 1)[1]
+    return key_or_path
+
 @st.cache_data(show_spinner=True)
 def load_excel_from_src(src_key: str, bytes_data: bytes | None, sheet_candidates=None):
-    xls = pd.ExcelFile(io.BytesIO(bytes_data)) if bytes_data else pd.ExcelFile(src_key)
-    if sheet_candidates:
-        for cand in sheet_candidates:
-            if cand in xls.sheet_names:
-                return xls.parse(cand)
-    return xls.parse(xls.sheet_names[0])
+    """
+    src_key: usado SOLO para la clave de caché; si no hay bytes y es un path,
+             puede venir con prefijos 'path_main::' o 'path_deleg::' (se limpian aquí).
+    """
+    try:
+        # Forzamos openpyxl para evitar problemas en Cloud (añadir a requirements.txt)
+        if bytes_data:
+            xls = pd.ExcelFile(io.BytesIO(bytes_data), engine="openpyxl")
+        else:
+            real_path = _strip_cache_prefix(src_key)
+            if not real_path or not os.path.exists(real_path):
+                raise FileNotFoundError(f"No existe el archivo Excel en ruta: {real_path!r}")
+            xls = pd.ExcelFile(real_path, engine="openpyxl")
+    except FileNotFoundError as e:
+        st.error(f"❌ No se encontró el archivo Excel.\n\nDetalles: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"❌ Error abriendo el Excel: {e}")
+        st.stop()
+
+    # Selección de hoja
+    try:
+        if sheet_candidates:
+            for cand in sheet_candidates:
+                if cand in xls.sheet_names:
+                    return xls.parse(cand)
+            st.info(f"ℹ️ Ninguna hoja candidata encontrada {sheet_candidates}. Se usará la primera: {xls.sheet_names[0]!r}.")
+        return xls.parse(xls.sheet_names[0])
+    except Exception as e:
+        st.error(f"❌ Error leyendo la hoja del Excel: {e}")
+        st.stop()
 
 def _resolve_main_df():
     bytes_main = None; src_key = None
     if st.session_state.get("upload_main"):
         h = _file_hash(st.session_state.upload_main)
-        src_key = f"upload_main::{h}"
+        src_key = f"upload_main::{h}"     # clave de caché
         st.session_state.upload_main.seek(0)
         bytes_main = st.session_state.upload_main.read()
     elif _EMBED_XLSX_B64:
@@ -286,8 +331,12 @@ def _resolve_main_df():
     else:
         path = next((p for p in REPO_CAND_MAIN if os.path.exists(p)), None)
         if path: src_key = f"path_main::{path}"
+
     if not src_key:
-        st.error("No se encontró el Excel principal. Carga **STREAMLIT.xlsx** (o variantes)."); st.stop()
+        st.error("No se encontró el Excel principal. Carga **STREAMLIT.xlsx** (o variantes).")
+        st.caption(f"Rutas probadas: {REPO_CAND_MAIN}")
+        st.stop()
+
     raw = load_excel_from_src(src_key, bytes_main, _SHEET_CANDIDATES)
     return normalize_cols(raw).copy()
 
@@ -304,8 +353,11 @@ def _resolve_deleg_df():
     else:
         path = next((p for p in REPO_CAND_DELEG if os.path.exists(p)), None)
         if path: src_key = f"path_deleg::{path}"
+
     if not src_key:
+        # Delegaciones es opcional: devuelve DF vacío sin error.
         return pd.DataFrame()
+
     return load_excel_from_src(src_key, bytes_d, None)
 
 # ========= Sidebar (estado estable + URL delta-aware) =========
@@ -393,43 +445,40 @@ for cat_col in ["Aula","Responsable","Corresponsable"]:
 df0 = ensure_sorted(df0)
 
 # Filtrado temporal base: Weekdays y meses Sep–Oct
-def _is_weekday(d: Optional[date]) -> bool: 
+def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
-def _only_sep_oct_weekdays(d: Optional[date]) -> bool: 
+def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
     return _is_weekday(d) and (d.month in (9,10))
 DF = df0[df0["_fecha"].map(_only_sep_oct_weekdays)].copy()
 
 @st.cache_data(show_spinner=False)
 def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
-    if not all(c in df.columns for c in cols): 
+    if not all(c in df.columns for c in cols):
         return df.copy()
     try:
         return df.sort_values(cols, kind="mergesort").drop_duplicates(subset=cols, keep="first")
     except Exception:
         return df.copy()
 
-# Si no hay filas tras el filtro base, detengo para evitar errores aguas abajo
-if DF.empty:
-    st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
-    st.stop()
-
 # ========= Lazy index & delegaciones =========
 @st.cache_data(show_spinner=False)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for _, r in df.iterrows():
-        part_list = _split_people(r.get("Participantes", ""))
+    it = df[["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participantes","Responsable","Corresponsable","Aula"]].itertuples(index=False, name=None)
+    for _fecha,_ini,_fin,nom_mesa,mesa,participantes,respo,corres,aula in it:
+        part_list = _split_people(participantes)
         extra = []
-        if _safe_str(r.get("Responsable")):    extra.append(_safe_str(r.get("Responsable")))
-        if _safe_str(r.get("Corresponsable")): extra.append(_safe_str(r.get("Corresponsable")))
+        if _safe_str(respo):    extra.append(_safe_str(respo))
+        if _safe_str(corres):   extra.append(_safe_str(corres))
         everyone = list(dict.fromkeys(extra + (part_list or [None])))
         if not everyone:
-            rows.append({**r.to_dict(), "Participante_individual": None})
+            rows.append((_fecha,_ini,_fin,nom_mesa,mesa,participantes,respo,corres,aula,None))
         else:
             for p in everyone:
-                rows.append({**r.to_dict(), "Participante_individual": p})
-    out = ensure_sorted(pd.DataFrame(rows))
+                rows.append((_fecha,_ini,_fin,nom_mesa,mesa,participantes,respo,corres,aula,p))
+    out = pd.DataFrame(rows, columns=["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participantes","Responsable","Corresponsable","Aula","Participante_individual"])
+    out = ensure_sorted(out)
     for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participantes","Mesa"]:
         if col in out.columns: out[f"__norm_{col}"] = out[col].fillna("").astype(str).map(_norm)
     if "Participante_individual" in out.columns:
@@ -442,11 +491,8 @@ deleg_raw = _resolve_deleg_df()
 
 @st.cache_data(show_spinner=False)
 def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
-    """Construye mapa de delegaciones robusto aunque falten columnas de hora."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["__actor","__actor_raw","__mesa","__fecha","__ini","__fin","__ini_m","__fin_m"])
-
-    # Detectar columnas
     col_actor = col_mesa = col_fecha = col_ini = col_fin = None
     for c in df.columns:
         cl = str(c).lower()
@@ -455,7 +501,6 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         if col_fecha is None and "fecha" in cl:  col_fecha = c
         if col_ini   is None and ("inicio" in cl or "hora inicio" in cl): col_ini = c
         if col_fin   is None and ("fin"    in cl or "hora fin"   in cl): col_fin = c
-
     if col_actor is None or col_mesa is None or col_fecha is None:
         return pd.DataFrame(columns=["__actor","__actor_raw","__mesa","__fecha","__ini","__fin","__ini_m","__fin_m"])
 
@@ -470,26 +515,20 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             return None
 
-    n = len(df)
-    raw_actor  = df[col_actor].astype(str).fillna("").map(str.strip)
-    ini_series = df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else pd.Series([None]*n)
-    fin_series = df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else pd.Series([None]*n)
-
+    raw_actor = df[col_actor].astype(str).fillna("").map(str.strip)
     out = pd.DataFrame({
         "__actor":     raw_actor.map(_norm),
         "__actor_raw": raw_actor,
         "__mesa":      df[col_mesa].astype(str).map(_norm_mesa_code),
         "__fecha":     pd.to_datetime(df[col_fecha], errors="coerce").dt.date,
-        "__ini":       ini_series,
-        "__fin":       fin_series,
+        "__ini":       df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else None,
+        "__fin":       df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else None
     }).dropna(subset=["__mesa","__fecha"])
-
     def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
-
-    out["__ini_m"] = out["__ini"].map(t2m)
-    out["__fin_m"] = out["__fin"].map(t2m)
+    out["__ini_m"] = out["__ini"].map(t2m) if "__ini" in out.columns else np.nan
+    out["__fin_m"] = out["__fin"].map(t2m) if "__fin" in out.columns else np.nan
     return out
 
 deleg_map = _prepare_deleg_map(deleg_raw)
@@ -618,6 +657,9 @@ section = st.session_state.sec
 KEY_COLS = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
 MAX_ROWS = 2000  # límite de filas renderizadas en tablas (exportes completos)
 
+if DF.empty:
+    st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
+
 # ---------------- Resumen ----------------
 if section == "Resumen":
     st.subheader("📈 Resumen ejecutivo (Lun–Vie, Sep–Oct)")
@@ -644,7 +686,7 @@ if section == "Resumen":
         with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
         all_people = []
-        for v in DFu["Participantes"].fillna("").astype(str).tolist(): 
+        for v in DFu["Participantes"].fillna("").astype(str).tolist():
             all_people += _split_people(v)
         s = pd.Series([p.strip() for p in all_people if p and str(p).strip()])
         top_people = s.value_counts().head(10).rename_axis("Persona").reset_index(name="Conteo")
@@ -1061,11 +1103,7 @@ elif section == "Delegaciones":
         fin_d_f = np.where(np.isnan(fin_d), 1e9,  fin_d)
         ok = has_ev & (np.maximum(ini_ev, ini_d_f) < np.minimum(fin_ev, fin_d_f))
         merged["__ok"] = ok | (np.isnan(ini_d) & np.isnan(fin_d) & has_ev)
-
-        # Agrupar por índice de la izquierda (cada evento)
-        grouped = merged[merged["__ok"]].groupby(merged.index)["__actor_raw"].apply(
-            lambda s: [x for x in pd.unique(s.dropna())]
-        )
+        grouped = merged[merged["__ok"]].groupby(merged.index)["__actor_raw"].apply(lambda s: [x for x in pd.unique(s.dropna())])
         out = df_events.copy()
         out["Deben delegar"] = grouped.reindex(df_events.index).apply(lambda x: x if isinstance(x,list) else []).tolist()
         return out
@@ -1145,7 +1183,7 @@ elif section == "Diferencias":
     a = st.file_uploader("Archivo A (.xlsx)", type=["xlsx"], key="diff_a")
     b = st.file_uploader("Archivo B (.xlsx)", type=["xlsx"], key="diff_b")
     if a and b:
-        A = normalize_cols(pd.ExcelFile(a).parse(0)); B = normalize_cols(pd.ExcelFile(b).parse(0))
+        A = normalize_cols(pd.ExcelFile(a, engine="openpyxl").parse(0)); B = normalize_cols(pd.ExcelFile(b, engine="openpyxl").parse(0))
         for df in (A,B):
             df["_fecha"] = df["Fecha"].apply(_to_date); df["_ini"] = df["Inicio"].apply(_to_time); df["_fin"] = df["Fin"].apply(_to_time)
         KEY = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
@@ -1211,20 +1249,22 @@ elif section == "Recomendador":
             day = fmin
             while day <= fmax:
                 if day.weekday() <= 4:
-                    for aula in aulas_sel:
-                        t = time(8,0)
-                        while t < time(18,0):
-                            start = datetime(day.year, day.month, day.day, t.hour, t.minute, tzinfo=TZ_DEFAULT)
-                            end   = start + timedelta(minutes=dur_min)
-                            win   = (start, end)
-                            c_room = overlaps_list(win, busy_by_room.get(_norm(aula), []))
-                            c_people = 0; pegado = 0.0
-                            for p in personas:
-                                iv = busy_by_person.get(_norm(p), [])
-                                c_people += overlaps_list(win, iv)
-                                pegado   += gap_cost(win, iv)
-                            cost = (10*c_room) + (5*c_people) + (0.1*pegado)
-                            if c_room==0 and c_people==0:
+                    t_cursor = time(8,0)
+                    while t_cursor < time(18,0):
+                        start = datetime(day.year, day.month, day.day, t_cursor.hour, t_cursor.minute, tzinfo=TZ_DEFAULT)
+                        end   = start + timedelta(minutes=dur_min)
+                        win   = (start, end)
+                        # costo aula
+                        c_room = overlaps_list(win, busy_by_room.get(_norm(aulas_sel[0]), [])) if aulas_sel else 0
+                        # costo personas
+                        c_people = 0; pegado = 0.0
+                        for p in personas:
+                            iv = busy_by_person.get(_norm(p), [])
+                            c_people += overlaps_list(win, iv)
+                            pegado   += gap_cost(win, iv)
+                        cost = (10*c_room) + (5*c_people) + (0.1*pegado)
+                        if c_room==0 and c_people==0:
+                            for aula in aulas_sel:
                                 proposals.append({"Fecha": day.isoformat(),
                                                   "Inicio": start.strftime("%H:%M"),
                                                   "Fin": end.strftime("%H:%M"),
@@ -1232,7 +1272,8 @@ elif section == "Recomendador":
                                                   "Conflictos": c_room+c_people,
                                                   "Pegado(min)": round(pegado,1),
                                                   "Costo": round(cost,2)})
-                            t = (datetime.combine(day, t) + timedelta(minutes=paso)).time()
+                        # avanzar
+                        t_cursor = (datetime.combine(day, t_cursor) + timedelta(minutes=paso)).time()
                 day += timedelta(days=1)
             if not proposals:
                 st.warning("No encontré opciones sin conflictos. Amplía rango o reduce restricciones.")
@@ -1260,6 +1301,53 @@ elif section == "Diagnóstico":
         st.session_state.tz = ZoneInfo(tz_opt) if tz_opt!="UTC" else timezone.utc
     except Exception:
         st.session_state.tz = TZ_DEFAULT
+
+    # Información de entorno y archivos
+    st.markdown("### 🧷 Fuentes y hojas detectadas")
+    st.write({"Candidatos STREAMLIT": REPO_CAND_MAIN, "Candidatos DELEGACIONES": REPO_CAND_DELEG})
+    try:
+        src_info = _qp_get("src_dbg", "")
+        if src_info: st.code(src_info)
+    except Exception:
+        pass
+
+    # Hoja(s) del principal (re-abre vía loader para listar)
+    try:
+        # Reutiliza la cache key más reciente posible
+        _ = None
+        if st.session_state.get("upload_main"):
+            _ = f"upload_main::{_file_hash(st.session_state.upload_main)}"
+        elif _EMBED_XLSX_B64:
+            _ = f"embed_main::{hashlib.sha1(_EMBED_XLSX_B64.encode()).hexdigest()}"
+        elif REPO_CAND_MAIN:
+            _ = f"path_main::{REPO_CAND_MAIN[0]}"
+        if _:
+            rp = _strip_cache_prefix(_)
+            st.caption(f"Ruta principal usada (diagnóstico): {rp}")
+            if os.path.exists(rp):
+                xl = pd.ExcelFile(rp, engine="openpyxl")
+                st.write({"Hojas disponibles": xl.sheet_names})
+    except Exception as e:
+        st.warning(f"No se pudieron listar las hojas: {e}")
+
+    # Tamaños y memoria
+    st.markdown("### 📦 Tamaños y memoria (aprox)")
+    def _mem_df(df: pd.DataFrame) -> str:
+        try:
+            return f"{df.memory_usage(deep=True).sum()/1024/1024:.2f} MB"
+        except Exception:
+            return "N/D"
+    st.write({
+        "Filas DF (Sep–Oct, Lun–Vie)": int(DF.shape[0]),
+        "Memoria DF": _mem_df(DF),
+        "Filas índice (si se usa)": "cacheado",
+    })
+    if 'rapidfuzz' in sys.modules:
+        st.success("RapidFuzz activo (búsqueda borrosa acelerada).")
+    else:
+        st.info("Usando difflib estándar para búsqueda borrosa.")
+
+    # Chequeos rápidos
     DFu = _dedup_events(DF)
     issues=[]
     def _err(row,col,msg): issues.append(f"Fila {int(row)+2} — {col}: {msg}")
@@ -1278,6 +1366,12 @@ elif section == "Diagnóstico":
     else:
         for it in issues:
             st.error("• " + it)
+
+    # Botón para liberar memoria de caches
+    if st.button("🧹 Limpiar cachés y recolector de basura"):
+        st.cache_data.clear()
+        gc.collect()
+        st.success("Cachés limpiados.")
 
 # ---------------- Acerca de ----------------
 else:
