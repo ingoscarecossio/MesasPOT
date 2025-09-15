@@ -147,7 +147,7 @@ def combine_dt(fecha, hora, tz: Optional[timezone]=None):
     d = fecha if isinstance(fecha, date) and not isinstance(fecha, datetime) else _to_date(fecha)
     t = hora if isinstance(hora, time) else _to_time(hora)
     if d is None or t is None: return None
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, t.second or 0, tzinfo=tz)
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, getattr(t, "second", 0) or 0, tzinfo=tz)
 
 def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -296,6 +296,7 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
+    # iterrows es suficiente aquí; el tamaño típico es manejable y luego cacheamos
     for _, r in df.iterrows():
         part_list = _split_people(r.get("Participantes", ""))
         extra = []
@@ -355,7 +356,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         "__fin":       df[col_fin].map(_to_t) if col_fin in df.columns else None
     }).dropna(subset=["__mesa","__fecha"])
     # minutos para vectorizar solape
-    def t2m(t): 
+    def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
     out["__ini_m"] = out["__ini"].map(t2m)
@@ -378,7 +379,7 @@ def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> p
     ev["actor_norm"]= ev["Participante_individual"].fillna("").astype(str).map(_norm)
 
     # minutos de evento
-    def t2m(t): 
+    def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
     ev["_ini_m"] = ev["_ini"].map(t2m)
@@ -403,7 +404,6 @@ def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> p
     overlap = has_ev_time & (np.maximum(ini_ev, ini_d_f) < np.minimum(fin_ev, fin_d_f))
 
     merged["__flag"] = overlap
-    # Si no hubo fila de deleg (NaNs en actor), el flag será False
     flags = merged.groupby("ev_idx")["__flag"].any().reindex(idxf.index, fill_value=False)
 
     out = idxf.copy()
@@ -419,7 +419,7 @@ def fuzzy_filter(series: pd.Series, q: str, thr=0.8) -> pd.Series:
         return pd.Series(True, index=series.index)
     # 1) contiene (rápido)
     fast = series.str.contains(qn, na=False)
-    if fast.any(): 
+    if fast.any():
         return fast
     # 2) difflib (solo si no hubo match rápido)
     return series.map(lambda s: difflib.SequenceMatcher(None, s, qn).ratio() >= thr)
@@ -508,14 +508,14 @@ if section == "Resumen":
         n_personas = len(pd.unique(pd.Series([p.strip() for p in allp if p]).astype(str)))
         return n_mesas, aulas, dias, n_personas
 
-    tm, na, nd, np = make_stats(DFu)
+    tm, na, nd, npers = make_stats(DFu)
     c1,c2,c3,c4 = st.columns(4)
     with c1: st.markdown(f"<div class='card'><div class='kpi'>Mesas</div><span class='value'>{tm}</span></div>", unsafe_allow_html=True)
     with c2: st.markdown(f"<div class='card'><div class='kpi'>Aulas</div><span class='value'>{na}</span></div>", unsafe_allow_html=True)
     with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
-    with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{np}</span></div>", unsafe_allow_html=True)
+    with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
-    # Gráficos optimizados
+    # Gráficos (evitar ternarios con llamadas Streamlit)
     all_people = []
     for v in DFu["Participantes"].fillna("").astype(str).tolist(): all_people += _split_people(v)
     s = pd.Series([p.strip() for p in all_people if p and str(p).strip()])
@@ -526,12 +526,19 @@ if section == "Resumen":
     c5, c6 = st.columns(2)
     with c5:
         st.markdown("**Top 10 personas por participación**")
-        st.plotly_chart(px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=380),
-                        use_container_width=True) if not top_people.empty else st.info("Sin datos.")
+        if not top_people.empty:
+            fig1 = px.bar(top_people, x="Conteo", y="Persona", orientation="h", height=380)
+            st.plotly_chart(fig1, use_container_width=True)
+        else:
+            st.info("Sin datos.")
+
     with c6:
         st.markdown("**Aulas más usadas (Top 10)**")
-        st.plotly_chart(px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=380),
-                        use_container_width=True) if not uso_aula.empty else st.info("Sin datos.")
+        if not uso_aula.empty:
+            fig2 = px.bar(uso_aula, x="Mesas", y="Aula", orientation="h", height=380)
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Sin datos.")
 
     dfh = DFu.copy()
     dfh["Día semana"] = dfh["_fecha"].map(lambda d: ["Lun","Mar","Mié","Jue","Vie"][d.weekday()] if d else None)
@@ -540,12 +547,16 @@ if section == "Resumen":
     c7, c8 = st.columns(2)
     with c7:
         st.markdown("**Mesas por día de la semana**")
-        st.plotly_chart(px.bar(by_dow, x="Día semana", y="Mesas", height=300), use_container_width=True)
+        fig3 = px.bar(by_dow, x="Día semana", y="Mesas", height=300)
+        st.plotly_chart(fig3, use_container_width=True)
     with c8:
         st.markdown("**Horas de inicio (histograma)**")
         hh = [t.hour for t in DFu["_ini"] if t is not None]
-        st.plotly_chart(px.histogram(pd.DataFrame({"Hora": hh}), x="Hora", nbins=12, height=300),
-                        use_container_width=True) if hh else st.info("Sin horas válidas.")
+        if hh:
+            fig4 = px.histogram(pd.DataFrame({"Hora": hh}), x="Hora", nbins=12, height=300)
+            st.plotly_chart(fig4, use_container_width=True)
+        else:
+            st.info("Sin horas válidas.")
 
 elif section == "Consulta":
     with st.expander("⚙️ Filtros (Lun–Vie, Sep–Oct)", expanded=False):
@@ -559,7 +570,7 @@ elif section == "Consulta":
 
         with c1:
             qp_rng = get_qp("rng", default=None, parse_json=True) if "rng" in st.query_params else None
-            def _parse_iso_date(s): 
+            def _parse_iso_date(s):
                 try: return date.fromisoformat(str(s)[:10])
                 except: return None
             def _safe_range_from_qp(rng, dmin, dmax):
@@ -823,7 +834,10 @@ elif section == "Conflictos":
         else:
             st.info("Seleccione una o más aulas.")
 
-    st.success("Sin solapes detectados. ✅") if dfc.empty else st.dataframe(dfc, use_container_width=True, hide_index=True)
+    if dfc.empty:
+        st.success("Sin solapes detectados. ✅")
+    else:
+        st.dataframe(dfc, use_container_width=True, hide_index=True)
 
 elif section == "Disponibilidad":
     st.subheader("🟢 Disponibilidad — usa el *Recomendador* para propuestas concretas.")
@@ -833,17 +847,14 @@ elif section == "Delegaciones":
     DFu = _dedup_events(DF).copy()
 
     def _actors_for_event_batch(df_events: pd.DataFrame) -> pd.DataFrame:
-        # Prepara join con grupos de delegaciones ya construidos
         ev = df_events[["_fecha","_ini","_fin","Nombre de la mesa","Mesa"]].copy()
         ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm)
-        # Join evento ↔ deleg_map (sin actor aquí — listaremos todos por mesa/fecha)
         merged = ev.merge(deleg_map, left_on=["mesa_norm","_fecha"], right_on=["__mesa","__fecha"], how="left")
         if merged.empty:
             df = df_events.copy()
             df["Deben delegar"] = [[] for _ in range(len(df))]
             return df
-        # solape temporal vectorizado (si deleg no trae horas, cualquier hora)
-        def t2m(t): 
+        def t2m(t):
             if pd.isna(t) or t is None: return np.nan
             return int(t.hour)*60 + int(t.minute)
         merged["_ini_m"] = merged["_ini"].map(t2m); merged["_fin_m"] = merged["_fin"].map(t2m)
@@ -854,9 +865,7 @@ elif section == "Delegaciones":
         fin_d_f = np.where(np.isnan(fin_d), 1e9,  fin_d)
         ok = has_ev & (np.maximum(ini_ev, ini_d_f) < np.minimum(fin_ev, fin_d_f))
         merged["__ok"] = ok | (np.isnan(ini_d) & np.isnan(fin_d) & has_ev)
-        # agrega nombres de actores por fila de evento
         grouped = merged[merged["__ok"]].groupby(merged.index)["__actor_raw"].apply(lambda s: [x for x in pd.unique(s.dropna())])
-        # Ensambla
         out = df_events.copy()
         out["Deben delegar"] = grouped.reindex(df_events.index).apply(lambda x: x if isinstance(x,list) else []).tolist()
         return out
@@ -886,19 +895,28 @@ elif section == "Calidad":
     bad_fecha = DF[DF["_fecha"].isna()]
     bad_ini   = DF[DF["_ini"].isna()]
     bad_fin   = DF[DF["_fin"].isna()]
-    wrong_order = DF[DF.apply(lambda r: r["_ini"] and r["_fin"] and (datetime.combine(date(2000,1,1), r["_fin"]) <= datetime.combine(date(2000,1,1), r["_ini"])), axis=1)]
+    wrong_order = DF[(DF["_ini"].notna()) & (DF["_fin"].notna()) &
+                     ((pd.to_datetime(DF["_fin"].astype(str)) <= pd.to_datetime(DF["_ini"].astype(str))))]
     dups = DF[DF.duplicated(subset=KEY_COLS, keep=False)].sort_values(KEY_COLS)
 
-    st.markdown("**Fechas faltantes**");         st.dataframe(bad_fecha[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True) if not bad_fecha.empty else st.success("OK")
-    st.markdown("**Hora de inicio faltante**");  st.dataframe(bad_ini[["Nombre de la mesa","Fecha","Inicio","Aula"]], use_container_width=True, hide_index=True) if not bad_ini.empty else st.success("OK")
-    st.markdown("**Hora de fin faltante**");     st.dataframe(bad_fin[["Nombre de la mesa","Fecha","Fin","Aula"]], use_container_width=True, hide_index=True) if not bad_fin.empty else st.success("OK")
-    st.markdown("**Fin ≤ Inicio**");             st.dataframe(wrong_order[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True) if not wrong_order.empty else st.success("OK")
+    st.markdown("**Fechas faltantes**")
+    if not bad_fecha.empty: st.dataframe(bad_fecha[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True)
+    else: st.success("OK")
+    st.markdown("**Hora de inicio faltante**")
+    if not bad_ini.empty: st.dataframe(bad_ini[["Nombre de la mesa","Fecha","Inicio","Aula"]], use_container_width=True, hide_index=True)
+    else: st.success("OK")
+    st.markdown("**Hora de fin faltante**")
+    if not bad_fin.empty: st.dataframe(bad_fin[["Nombre de la mesa","Fecha","Fin","Aula"]], use_container_width=True, hide_index=True)
+    else: st.success("OK")
+    st.markdown("**Fin ≤ Inicio**")
+    if not wrong_order.empty: st.dataframe(wrong_order[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True)
+    else: st.success("OK")
     st.markdown("**Duplicados por clave (Fecha, Inicio, Fin, Aula, Mesa)**")
-    st.dataframe(dups[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True) if not dups.empty else st.success("Sin duplicados.")
+    if not dups.empty: st.dataframe(dups[["Nombre de la mesa","Fecha","Inicio","Fin","Aula"]], use_container_width=True, hide_index=True)
+    else: st.success("Sin duplicados.")
 
     # Reconciliación de Delegaciones (sin mesa/fecha correspondiente)
     st.subheader("🔎 Reconciliación Delegaciones")
-    # (vectorizado simple)
     m_norm = DF["Mesa"].fillna(DF["Nombre de la mesa"]).astype(str).map(_norm)
     k_ev = set(zip(m_norm, DF["_fecha"]))
     no_match = deleg_map[~deleg_map.apply(lambda r: (r["__mesa"], r["__fecha"]) in k_ev, axis=1)]
@@ -941,7 +959,6 @@ elif section == "Recomendador":
     dr = st.date_input("Rango de búsqueda", value=(dmin, dmax), min_value=dmin, max_value=dmax)
     fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
 
-    # Mapas de ocupación (caché implícita por datos)
     @st.cache_data(show_spinner=False)
     def person_busy_map(df: pd.DataFrame) -> Dict[str, List[Tuple[datetime, datetime]]]:
         mp: Dict[str, List[Tuple[datetime, datetime]]] = {}
@@ -1037,7 +1054,11 @@ elif section == "Diagnóstico":
     if all(c in DFu.columns for c in KEY_COLS):
         n_dups = int(DFu.duplicated(subset=KEY_COLS, keep=False).sum())
         if n_dups: issues.append(f"{n_dups} duplicados por clave {KEY_COLS}.")
-    st.success("Sin problemas críticos. ✅") if not issues else [st.error("• "+it) for it in issues]
+    if not issues:
+        st.success("Sin problemas críticos. ✅")
+    else:
+        for it in issues:
+            st.error("• " + it)
 
 else:
     st.subheader("ℹ️ Acerca de")
