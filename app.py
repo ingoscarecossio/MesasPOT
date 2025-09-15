@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Mesas · INIMAGINABLE — versión productiva optimizada
+Mesas · INIMAGINABLE — versión productiva optimizada (FIX)
 - Fechas AAAA-MM-DD, sólo Lun–Vie, meses Sep–Oct
-- KPIs + gráficos en Resumen
+- KPIs + gráficos en Resumen (sin ternarios con st.*)
 - Consulta con vistas guardadas (URL)
 - Delegaciones desde DELEGACIONES.xlsx (columna 'actor') — cálculo vectorizado
 - Conflictos sweep-line, Exportes ICS/CSV/XLSX
-- Panel de Calidad, Diferencias entre archivos, Recomendador de horario
+- Panel de Calidad (comparación estable de horas), Diferencias entre archivos, Recomendador
 - Cachés y joins vectorizados para performance
+- Manejo robusto de datos vacíos y combine_dt con segundos seguros
 """
 import io, re, base64, unicodedata, difflib, os, json, hashlib
 from datetime import datetime, date, time, timedelta, timezone
@@ -147,7 +148,8 @@ def combine_dt(fecha, hora, tz: Optional[timezone]=None):
     d = fecha if isinstance(fecha, date) and not isinstance(fecha, datetime) else _to_date(fecha)
     t = hora if isinstance(hora, time) else _to_time(hora)
     if d is None or t is None: return None
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, getattr(t, "second", 0) or 0, tzinfo=tz)
+    sec = getattr(t, "second", 0) or 0
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, sec, tzinfo=tz)
 
 def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -259,7 +261,7 @@ def clean_delegate_markers(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["Participantes", "Responsable", "Corresponsable"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).apply(_strip_delegate_marker)
-    df["Requiere Delegación"] = False  # el marcador visual del archivo no gobierna la obligación
+    df["Requiere Delegación"] = False
     return df
 
 df0 = clean_delegate_markers(df0)
@@ -296,7 +298,6 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    # iterrows es suficiente aquí; el tamaño típico es manejable y luego cacheamos
     for _, r in df.iterrows():
         part_list = _split_people(r.get("Participantes", ""))
         extra = []
@@ -309,7 +310,6 @@ def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
             for p in everyone:
                 rows.append({**r.to_dict(), "Participante_individual": p})
     out = ensure_sorted(pd.DataFrame(rows))
-    # normalizados para búsqueda
     for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participantes","Mesa"]:
         if col in out.columns: out[f"__norm_{col}"] = out[col].fillna("").astype(str).map(_norm)
     out["__norm_part"] = out["Participante_individual"].fillna("").astype(str).map(_norm)
@@ -355,7 +355,6 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         "__ini":       df[col_ini].map(_to_t) if col_ini in df.columns else None,
         "__fin":       df[col_fin].map(_to_t) if col_fin in df.columns else None
     }).dropna(subset=["__mesa","__fecha"])
-    # minutos para vectorizar solape
     def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
@@ -371,41 +370,29 @@ def annotate_delegations_vectorized(idxf: pd.DataFrame, dmap: pd.DataFrame) -> p
         out = idxf.copy()
         out["__delegado_por_archivo"] = False
         return out
-
-    # Eventos por persona (actor) → claves para join
     ev = idxf[["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participante_individual"]].copy()
     ev["ev_idx"]   = ev.index
     ev["mesa_norm"]= ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm)
     ev["actor_norm"]= ev["Participante_individual"].fillna("").astype(str).map(_norm)
-
-    # minutos de evento
     def t2m(t):
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
     ev["_ini_m"] = ev["_ini"].map(t2m)
     ev["_fin_m"] = ev["_fin"].map(t2m)
-
-    # Join por mesa, fecha, actor
     merged = ev.merge(
         dmap, left_on=["mesa_norm","_fecha","actor_norm"],
         right_on=["__mesa","__fecha","__actor"], how="left", suffixes=("","_d")
     )
-
-    # Overlap vectorizado: si deleg no trae horas, cuenta como True; si evento no trae horas → False
     ini_ev = merged["_ini_m"].to_numpy()
     fin_ev = merged["_fin_m"].to_numpy()
     ini_d  = merged["__ini_m"].to_numpy()
     fin_d  = merged["__fin_m"].to_numpy()
-
     has_ev_time = (~np.isnan(ini_ev)) & (~np.isnan(fin_ev))
     ini_d_f = np.where(np.isnan(ini_d), -1,    ini_d)
     fin_d_f = np.where(np.isnan(fin_d),  1e9,  fin_d)
-
     overlap = has_ev_time & (np.maximum(ini_ev, ini_d_f) < np.minimum(fin_ev, fin_d_f))
-
     merged["__flag"] = overlap
     flags = merged.groupby("ev_idx")["__flag"].any().reindex(idxf.index, fill_value=False)
-
     out = idxf.copy()
     out["__delegado_por_archivo"] = flags.values
     return out
@@ -417,11 +404,9 @@ def fuzzy_filter(series: pd.Series, q: str, thr=0.8) -> pd.Series:
     qn = _norm(q)
     if not qn:
         return pd.Series(True, index=series.index)
-    # 1) contiene (rápido)
     fast = series.str.contains(qn, na=False)
     if fast.any():
         return fast
-    # 2) difflib (solo si no hubo match rápido)
     return series.map(lambda s: difflib.SequenceMatcher(None, s, qn).ratio() >= thr)
 
 # ========= ICS =========
@@ -492,6 +477,10 @@ st.divider()
 # ========= Secciones =========
 KEY_COLS = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
 
+# Ayuda: si DF está vacío, avisamos (no detenemos la app)
+if DF.empty:
+    st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
+
 if section == "Resumen":
     st.subheader("📈 Resumen ejecutivo (Lun–Vie, Sep–Oct)")
     DFu = _dedup_events(DF)
@@ -515,7 +504,7 @@ if section == "Resumen":
     with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
     with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
-    # Gráficos (evitar ternarios con llamadas Streamlit)
+    # Gráficos (sin ternarios con st.*)
     all_people = []
     for v in DFu["Participantes"].fillna("").astype(str).tolist(): all_people += _split_people(v)
     s = pd.Series([p.strip() for p in all_people if p and str(p).strip()])
@@ -770,7 +759,7 @@ elif section == "Conflictos":
     with c3:
         try: gap_default = int(gap_qp)
         except Exception: gap_default = 10
-        brecha = st.slider("Brecha mínima (min)", 0, 60, gap_default)
+        brecha = int(st.slider("Brecha mínima (min)", 0, 60, gap_default))
     set_qp(applydel=aplicar_deleg, gap=brecha)
 
     def overlaps(events: List[Dict], gap_min=0):
@@ -895,8 +884,14 @@ elif section == "Calidad":
     bad_fecha = DF[DF["_fecha"].isna()]
     bad_ini   = DF[DF["_ini"].isna()]
     bad_fin   = DF[DF["_fin"].isna()]
-    wrong_order = DF[(DF["_ini"].notna()) & (DF["_fin"].notna()) &
-                     ((pd.to_datetime(DF["_fin"].astype(str)) <= pd.to_datetime(DF["_ini"].astype(str))))]
+
+    def _cmp_time(t):  # ancla horas al mismo día para comparar
+        return datetime.combine(date(2000,1,1), t)
+
+    wrong_order = DF[
+        DF["_ini"].notna() & DF["_fin"].notna() &
+        DF.apply(lambda r: _cmp_time(r["_fin"]) <= _cmp_time(r["_ini"]), axis=1)
+    ]
     dups = DF[DF.duplicated(subset=KEY_COLS, keep=False)].sort_values(KEY_COLS)
 
     st.markdown("**Fechas faltantes**")
@@ -917,14 +912,17 @@ elif section == "Calidad":
 
     # Reconciliación de Delegaciones (sin mesa/fecha correspondiente)
     st.subheader("🔎 Reconciliación Delegaciones")
-    m_norm = DF["Mesa"].fillna(DF["Nombre de la mesa"]).astype(str).map(_norm)
-    k_ev = set(zip(m_norm, DF["_fecha"]))
-    no_match = deleg_map[~deleg_map.apply(lambda r: (r["__mesa"], r["__fecha"]) in k_ev, axis=1)]
-    if not no_match.empty:
-        st.warning("Delegaciones sin mesa/fecha coincidente:")
-        st.dataframe(no_match[["__actor_raw","__mesa","__fecha","__ini","__fin"]], use_container_width=True, hide_index=True)
+    if not DF.empty and not deleg_map.empty:
+        m_norm = DF["Mesa"].fillna(DF["Nombre de la mesa"]).astype(str).map(_norm)
+        k_ev = set(zip(m_norm, DF["_fecha"]))
+        no_match = deleg_map[~deleg_map.apply(lambda r: (r["__mesa"], r["__fecha"]) in k_ev, axis=1)]
+        if not no_match.empty:
+            st.warning("Delegaciones sin mesa/fecha coincidente:")
+            st.dataframe(no_match[["__actor_raw","__mesa","__fecha","__ini","__fin"]], use_container_width=True, hide_index=True)
+        else:
+            st.success("Todas las delegaciones referencian mesa/fecha existente.")
     else:
-        st.success("Todas las delegaciones referencian mesa/fecha existente.")
+        st.info("Sin datos suficientes para reconciliar delegaciones.")
 
 elif section == "Diferencias":
     st.subheader("🧭 Diferencias entre archivos")
