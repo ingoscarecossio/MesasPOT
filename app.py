@@ -604,9 +604,34 @@ with sec[1]:
         responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         rsel = st.multiselect("Responsables", responsables, default=[])
     with c4:
-        term = st.text_input("Persona (texto)", value=_qp_get("q",""))
-        if st.button("Buscar", use_container_width=True):
-            _qp_set({"q":term})
+        # Lista de personas (se construye con el DF ya filtrado para no subir RAM)
+        people = sorted({
+            p for p in set(
+                # desde índice expandido (participantes individuales)
+                idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                # + responsables/corresponsables del DF filtrado globalmente
+                + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
+            ) if p
+        })
+    
+        # Entrada híbrida: texto + selector (con búsqueda interna del selectbox)
+        txt = st.text_input("Persona (escribe parcial)", value=_qp_get("q",""))
+        sel = st.selectbox("…o selecciónala de la lista", options=[""] + people, index=0)
+    
+        # Acciones
+        bcols = st.columns([1,1])
+        with bcols[0]:
+            if st.button("Buscar", use_container_width=True):
+                elegido = (txt or sel or "").strip()
+                _qp_set({"q": elegido})
+        with bcols[1]:
+            if st.button("Limpiar", use_container_width=True):
+                _qp_set({"q": ""})
+    
+    # Termino efectivo para el filtrado (preferimos lo que haya en la URL/estado)
+    term = (_qp_get("q","") or "").strip()
+
 
     # Máscara vectorizada (sin usar columnas inexistentes)
     mask = pd.Series(True, index=idx.index, dtype=bool)
