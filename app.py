@@ -5,12 +5,13 @@ Secciones: Resumen, Consulta, Agenda, Gantt, Heatmap, Delegaciones
 
 - Cache por hash con TTL + max_entries
 - Índices/normalizaciones perezosos
-- Downcast + category
+- Downcast seguro (int/float) + category en campos repetidos
 - Modo ligero para datasets grandes (evita gráficos costosos)
 - Límite de filas renderizadas (exportes completos aparte)
 - Consulta híbrida (texto + selector)
 - Agenda con 'Objetivo' (si existe)
 - Delegaciones filtrando por 'Deben delegar'
+- ❗ Parser de fechas robusto para AAAA-DD-MM (año–día–mes)
 """
 
 import io, re, base64, unicodedata, difflib, os, json, hashlib, glob, sys, gc
@@ -22,10 +23,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-
 # ============= Config básica y apariencia =============
-st.set_page_config(page_title="Cronograma Mesas POT — Light", page_icon="🗂️",
-                   layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Cronograma Mesas POT — Light",
+    page_icon="🗂️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     row_pad = {"compacta":"0.25rem","media":"0.5rem","amplia":"0.8rem"}.get(density,"0.5rem")
@@ -48,7 +52,6 @@ def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "comp
     .dataframe th, .dataframe td {{ background:transparent !important; }}
     </style>
     """, unsafe_allow_html=True)
-
 
 # ============= Constantes y utilidades =============
 try:
@@ -77,9 +80,7 @@ COLUMN_ALIASES = {
     "Objetivo": ["Objetivo", "Objetivo de la reunión", "Objetivo de la reunion",
                  "Descripción", "Descripcion", "Observaciones"],  # opcional
 }
-
 OPTIONAL_COLS = {"Delegaciones", "Objetivo"}
-
 
 # ===== Helpers =====
 def _safe_str(x):
@@ -127,7 +128,6 @@ def _glob_candidates(prefix: str):
 REPO_CAND_MAIN  = _glob_candidates("STREAMLIT")
 REPO_CAND_DELEG = _glob_candidates("DELEGACIONES")
 
-
 # ===== Query Params (compat) =====
 def _qp_get_all():
     try: return dict(st.query_params)
@@ -155,18 +155,60 @@ def _qp_update_if_changed(mapping: Dict[str, object]):
         if str(cur_v) != new_v: to_set[k] = v
     if to_set: _qp_set(to_set)
 
-
 # ===== Conversión fecha/hora =====
+# Soporta explícitamente AAAA-DD-MM (año–día–mes) y variantes comunes.
+_DATE_YDM = re.compile(r"^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s*$")  # año-?-?
+_DATE_DMY = re.compile(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\s*$")  # dd-mm-aaaa
 def _to_date(x):
+    # datetime/date directo
     if isinstance(x, date) and not isinstance(x, datetime): return x
     if isinstance(x, datetime): return x.date()
+
+    # Serial de Excel (número de días desde 1899-12-30)
+    if isinstance(x, (int, float)) and not pd.isna(x):
+        try:
+            base = datetime(1899, 12, 30)
+            return (base + timedelta(days=float(x))).date()
+        except Exception:
+            pass
+
+    # Texto
     if x is None or (isinstance(x, float) and np.isnan(x)): return None
-    try: return datetime.strptime(str(x).strip(), "%Y-%m-%d").date()
-    except Exception:
-        d = pd.to_datetime(x, errors="coerce", utc=False)
-        if pd.isna(d): return None
-        if isinstance(d, pd.Timestamp): return d.date()
-        return None
+    s = str(x).strip()
+    if not s: return None
+    s2 = s.replace(".", "-").replace("/", "-")
+
+    # Preferencia del usuario: AAAA-DD-MM (año–día–mes)
+    m = _DATE_YDM.match(s2)
+    if m:
+        y, a, b = map(int, m.groups())
+        # Intento 1: Y-D-M
+        d, mo = a, b
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            try: return date(y, mo, d)
+            except ValueError: pass
+        # Intento 2: Y-M-D (fallback si lo anterior no es válido)
+        mo, d = a, b
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            try: return date(y, mo, d)
+            except ValueError: pass
+
+    # dd-mm-aaaa
+    m2 = _DATE_DMY.match(s2)
+    if m2:
+        d, mo, y = m2.groups()
+        d, mo, y = int(d), int(mo), int(y)
+        if y < 100: y += 2000  # por si viene a dos dígitos
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            try: return date(y, mo, d)
+            except ValueError: pass
+
+    # Último recurso: pandas (permite strings locales)
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=False, yearfirst=True)
+    if not pd.isna(dt):
+        if isinstance(dt, pd.Timestamp): return dt.date()
+    # Nada funcionó
+    return None
 
 def _to_time(x):
     if isinstance(x, time): return x.replace(microsecond=0)
@@ -175,9 +217,12 @@ def _to_time(x):
     d = pd.to_datetime(x, errors="coerce")
     if not pd.isna(d) and isinstance(d, pd.Timestamp): return d.time().replace(microsecond=0)
     try:
-        s = str(x).strip();  hh, mm = s.split(":")[:2]
+        s = str(x).strip()
+        if not s: return None
+        hh, mm = s.split(":")[:2]
         return time(int(hh), int(mm))
-    except Exception: return None
+    except Exception: 
+        return None
 
 def combine_dt(fecha, hora, tz: Optional[timezone]=None):
     tz = tz or TZ_DEFAULT
@@ -195,7 +240,6 @@ def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
 
 def _select_existing(df: pd.DataFrame, cols: List[str]) -> List[str]:
     return [c for c in cols if c in df.columns]
-
 
 # ===== Normalización columnas =====
 def find_col(df: pd.DataFrame, canonical: str):
@@ -218,7 +262,6 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
             st.stop()
         mapping[col] = canonical
     return df.rename(columns=mapping)
-
 
 # ===== Carga de Excel (cache por hash con TTL) =====
 def _file_hash(file_obj_or_path) -> str:
@@ -286,7 +329,6 @@ def _resolve_deleg_df():
         return pd.DataFrame()
     return load_excel_from_src(src_key, bytes_d, None)
 
-
 # ===== Limpieza + tipos =====
 def _split_people(cell):
     if pd.isna(cell): return []
@@ -307,14 +349,18 @@ def clean_delegate_markers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _downcast_and_categorize(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajuste de memoria: category en textos repetidos y downcast numérico."""
+    """Ajuste de memoria: category en textos repetidos y downcast numérico seguro."""
     df = df.copy()
     for col in ["Aula","Responsable","Corresponsable"]:
         if col in df.columns:
             try: df[col] = df[col].astype("category")
             except Exception: pass
-    for col in df.select_dtypes(include=["float64","int64"]).columns:
+    # enteros → int32 / floats → float32 (no cast de float a int)
+    for col in df.select_dtypes(include=["int64","Int64"]).columns:
         try: df[col] = pd.to_numeric(df[col], downcast="integer")
+        except Exception: pass
+    for col in df.select_dtypes(include=["float64"]).columns:
+        try: df[col] = pd.to_numeric(df[col], downcast="float")
         except Exception: pass
     return df
 
@@ -327,7 +373,6 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         return df.copy()
 
-
 # ===== Índice perezoso por persona =====
 @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
@@ -339,8 +384,9 @@ def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
         rec = dict(zip(use_cols, tup))
         part_list = _split_people(rec.get("Participantes"))
         extra = []
-        if _safe_str(rec.get("Responsable")):   extra.append(_safe_str(rec.get("Responsable")))
-        if _safe_str(rec.get("Corresponsable")):extra.append(_safe_str(rec.get("Corresponsable")))
+        rs = _safe_str(rec.get("Responsable")); cs = _safe_str(rec.get("Corresponsable"))
+        if rs: extra.append(rs)
+        if cs: extra.append(cs)
         everyone = list(dict.fromkeys(extra + (part_list or [None])))
         if not everyone:
             rows.append((rec.get("_fecha"),rec.get("_ini"),rec.get("_fin"),rec.get("Nombre de la mesa"),rec.get("Mesa"),
@@ -365,7 +411,6 @@ def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
             try: out[col] = out[col].astype("category")
             except: pass
     return out
-
 
 # ===== Delegaciones (mapa) =====
 @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
@@ -399,7 +444,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         "__actor":     raw_actor.map(_norm),
         "__actor_raw": raw_actor,
         "__mesa":      df[col_mesa].astype(str).map(_norm_mesa_code),
-        "__fecha":     pd.to_datetime(df[col_fecha], errors="coerce").dt.date,
+        "__fecha":     df[col_fecha].map(_to_date),
         "__ini":       df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else None,
         "__fin":       df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else None
     }).dropna(subset=["__mesa","__fecha"])
@@ -409,7 +454,6 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
     out["__ini_m"] = out["__ini"].map(t2m) if "__ini" in out.columns else np.nan
     out["__fin_m"] = out["__fin"].map(t2m) if "__fin" in out.columns else np.nan
     return out
-
 
 # ===== Fuzzy search =====
 try:
@@ -427,7 +471,6 @@ except Exception:
         fast = series.str.contains(qn, na=False)
         if fast.any(): return fast
         return series.map(lambda s: difflib.SequenceMatcher(None, s, qn).ratio() >= thr)
-
 
 # ===== ICS =====
 def escape_text(val: str) -> str:
@@ -474,7 +517,6 @@ def build_ics(rows: pd.DataFrame, calendar_name="Cronograma Mesas POT"):
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines).encode("utf-8")
 
-
 # ============= Sidebar =============
 if "dark" not in st.session_state: st.session_state.dark = True
 with st.sidebar:
@@ -485,44 +527,49 @@ with st.sidebar:
     st.markdown("### 📦 Datos")
     st.file_uploader("STREAMLIT.xlsx",    type=["xlsx"], key="upload_main")
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
+    only_weekdays = st.checkbox("Solo Lun–Vie (global)", value=True, key="filt_habiles")
     if st.button("🧹 Limpiar cachés", key="house_gc_btn"):
         st.cache_data.clear()
         gc.collect()
         st.success("Cachés limpiadas y GC ejecutado.")
 
 inject_base_css(st.session_state.dark, 0.75, densidad)
-
 st.markdown("<h1 class='gradient-title'>🗂️ Cronograma Mesas POT — Light</h1>", unsafe_allow_html=True)
-st.caption("Modo ligero • Cache por hash • Índices perezosos • Memoria optimizada")
-
+st.caption("Modo ligero • Cache por hash • Índices perezosos • Memoria optimizada • Parser AAAA-DD-MM")
 
 # ============= Carga principal =============
 df0 = _resolve_main_df()
 df0 = clean_delegate_markers(df0)
+
+# Fechas/horas (con parser robusto AAAA-DD-MM)
 df0["_fecha"] = df0["Fecha"].apply(_to_date)
 df0["_ini"]   = df0["Inicio"].apply(_to_time)
 df0["_fin"]   = df0["Fin"].apply(_to_time)
+
+# Normalizaciones (vectorizadas)
 for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la mesa","Mesa","Objetivo"]:
     if col in df0.columns:
         df0[col] = df0[col].astype(str)
         df0[f"__norm_{col}"] = df0[col].fillna("").astype(str).map(_norm)
+
 df0 = _downcast_and_categorize(df0)
 df0 = ensure_sorted(df0)
 
-# Filtro temporal base — solo lun–vie y meses Sep–Oct (ajústalo si quieres ampliar)
 def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
-def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
-    return _is_weekday(d) and (d.month in (9,10))
-DF = df0[df0["_fecha"].map(_only_sep_oct_weekdays)].copy()
+
+# Filtro base global (sin restringir meses)
+DF = df0[df0["_fecha"].map(_is_weekday)] if only_weekdays else df0.copy()
 
 if DF.empty:
-    st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
+    st.warning("No hay filas válidas con los filtros globales actuales (revisa fechas en el Excel o desactiva 'Solo Lun–Vie').")
+
+# Índice por persona (cacheado y reutilizable)
+IDX = build_index_cached(DF)
 
 # Secciones disponibles
 sections = ["Resumen","Consulta","Agenda","Gantt","Heatmap","Delegaciones"]
 sec = st.tabs(sections)
-
 
 # ============= Sección: Resumen =============
 with sec[0]:
@@ -549,7 +596,6 @@ with sec[0]:
         with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
         with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
-        # Top personas y aulas (compacto)
         if DFu.shape[0] <= 20000 or not lite:
             all_people = []
             for v in DFu["Participantes"].fillna("").astype(str).tolist():
@@ -576,7 +622,6 @@ with sec[0]:
         else:
             st.caption("Se omitieron gráficos pesados por Modo ligero y tamaño de datos.")
 
-        # ---------- Resúmenes rápidos (ligeros) ----------
         with st.expander("📌 Resúmenes rápidos (ligeros)", expanded=False):
             base = _dedup_events(DFu)
 
@@ -651,20 +696,18 @@ with sec[0]:
                 else:
                     st.info("Sin datos suficientes.")
 
-
 # ============= Sección: Consulta (híbrida) =============
 with sec[1]:
     st.subheader("🔎 Consulta filtrada")
-    @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
-    def _get_idx(df: pd.DataFrame) -> pd.DataFrame:
-        return build_index_cached(df)
-    idx = _get_idx(DF)
+
+    idx = IDX  # ya cacheado
 
     # Filtros compactos
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-    else: today = date.today(); dmin, dmax = today, today
+    else: 
+        today = date.today(); dmin, dmax = today, today
     with c1:
         dr = st.date_input("Rango fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="consulta_rango")
         fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
@@ -673,32 +716,27 @@ with sec[1]:
         aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"], key="cons_aulas")
         dow_opts = ["Lun","Mar","Mié","Jue","Vie"]; dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
-        dow = st.multiselect("Días", dow_opts, default=dow_opts, key="cons_dow")
+        dow = st.multiselect("Días", dow_opts, default=dow_opts if st.session_state.get("filt_habiles", True) else dow_opts, key="cons_dow")
     with c3:
         responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         rsel = st.multiselect("Responsables", responsables, default=[], key="cons_resp")
     with c4:
-        # Entrada híbrida: texto y selector (el texto tiene prioridad)
         person_txt  = st.text_input("Persona (texto)", value=_qp_get("q",""), key="consulta_persona_txt")
-        # Sugerencias para selector (si hay texto, filtra; si no, muestra todo)
         people_all = sorted({p for p in set(idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
                             + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
                             + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()) if p})
         if person_txt:
             normq = _norm(person_txt)
-            people_opts = [p for p in people_all if normq in _norm(p)]
-            if not people_opts: people_opts = people_all
+            people_opts = [p for p in people_all if normq in _norm(p)] or people_all
         else:
             people_opts = people_all
         person_pick = st.selectbox("…o selecciónala", options=[""] + people_opts, index=0, key="consulta_persona_pick")
         if st.button("Buscar", use_container_width=True, key="consulta_buscar_btn"):
             _qp_set({"q": person_txt or person_pick})
 
-    # Valor efectivo de búsqueda
     term = (person_txt or person_pick or "").strip()
 
-    # Máscara vectorizada (sin usar columnas inexistentes)
-    idx = idx  # ya construido
+    # Máscara vectorizada
     mask = pd.Series(True, index=idx.index, dtype=bool)
     mask &= idx["_fecha"].between(fmin, fmax, inclusive="both")
     dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
@@ -759,16 +797,11 @@ with sec[1]:
         st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name="Cronograma Mesas POT"),
                            mime="text/calendar", file_name="mesas.ics", key="cons_dl_ics")
 
-
 # ============= Sección: Agenda (con Objetivo) =============
 with sec[2]:
     st.subheader("🗓️ Agenda por persona")
-    @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
-    def _get_idx(df: pd.DataFrame) -> pd.DataFrame:
-        return build_index_cached(df)
-    idx = _get_idx(DF)
 
-    people_all = sorted({p for p in set(idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
+    people_all = sorted({p for p in set(IDX.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
                         + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
                         + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()) if p})
     q_txt = st.text_input("Buscar persona (texto)", value="", key="agenda_persona_txt")
@@ -780,13 +813,13 @@ with sec[2]:
     persona = st.selectbox("Seleccione persona", options=[""] + people_opts, index=0, key="agenda_persona_pick")
 
     if persona:
-        m = (fuzzy_filter(idx["__norm_part"], persona, 0.9) |
-             fuzzy_filter(idx["__norm_Responsable"], persona, 0.9) |
-             fuzzy_filter(idx["__norm_Corresponsable"], persona, 0.9))
+        m = (fuzzy_filter(IDX["__norm_part"], persona, 0.9) |
+             fuzzy_filter(IDX["__norm_Responsable"], persona, 0.9) |
+             fuzzy_filter(IDX["__norm_Corresponsable"], persona, 0.9))
         cols_ag     = ["_fecha","_ini","_fin","Aula","Nombre de la mesa","Responsable",
                        "Corresponsable","Participantes","Objetivo"]
-        use_cols_ag = _select_existing(idx, cols_ag)
-        rows        = _dedup_events(idx.loc[m, use_cols_ag].copy())
+        use_cols_ag = _select_existing(IDX, cols_ag)
+        rows        = _dedup_events(IDX.loc[m, use_cols_ag].copy())
         rows = ensure_sorted(rows)
         if rows.empty:
             st.info("Sin eventos para esta persona.")
@@ -807,10 +840,9 @@ with sec[2]:
                 data=build_ics(rows, calendar_name=f"Agenda — {persona}"),
                 mime="text/calendar", file_name=f"agenda_{persona}.ics", key="agenda_dl_ics")
 
-
 # ============= Sección: Gantt =============
 with sec[3]:
-    st.subheader("📊 Gantt (Lun–Vie Sep–Oct)")
+    st.subheader("📊 Gantt (rango completo)")
     DFu = _dedup_events(DF)
     if lite and DFu.shape[0] > 6000:
         st.info("Modo ligero activo: desactívalo o filtra en Consulta para ver el Gantt.")
@@ -828,7 +860,6 @@ with sec[3]:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No hay datos para Gantt.")
-
 
 # ============= Sección: Heatmap =============
 with sec[4]:
@@ -850,7 +881,6 @@ with sec[4]:
                 fig = px.imshow(piv, aspect="auto", labels=dict(color="Mesas"))
                 fig.update_layout(height=500, margin=dict(l=6,r=6,t=28,b=14))
                 st.plotly_chart(fig, use_container_width=True)
-
 
 # ============= Sección: Delegaciones (filtra por "Deben delegar") =============
 with sec[5]:
