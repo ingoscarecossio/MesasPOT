@@ -7,8 +7,7 @@ Secciones: Resumen, Consulta, Agenda, Gantt, Heatmap, Delegaciones
 - Downcast + category
 - Modo ligero para datasets grandes (evita gráficos costosos)
 - Límite de filas renderizadas en tablas (exportes completos aparte)
-- Analítica ligera on-demand (cacheada)
-- Consulta y Agenda híbridas (texto + selección)
+- "Consulta" y "Agenda" con entrada híbrida (texto o selector)
 - Delegaciones con filtros
 """
 
@@ -61,7 +60,7 @@ MAX_ROWS = 1500
 
 COLUMN_ALIASES = {
     "Mesa": ["Mesa", "N° Mesa", "No Mesa", "Numero Mesa", "Número Mesa"],
-    "Nombre de la mesa": ["Nombre de la mesa", "Nombre mesa", "Mesa - Nombre", "Titulo Mesa", "Título Mesa"],
+    "Nombre de la mesa": ["Nombre de la mesa", "Nombre mesa", "Mesa - Nombre", "Titulo Mesa", "Título Mesa", "Asunto", "Tema"],
     "Fecha": ["Fecha", "Día", "Dia"],
     "Inicio": ["Inicio", "Hora inicio", "Hora de inicio", "Start", "From"],
     "Fin": ["Fin", "Hora fin", "Hora de fin", "End", "To"],
@@ -69,21 +68,16 @@ COLUMN_ALIASES = {
     "Participantes": ["Participantes", "Asistentes", "Invitados"],
     "Responsable": ["Responsable"],
     "Corresponsable": ["Corresponsable", "Co-responsable", "Co Responsable"],
+    # "Delegaciones" y "Objetivo" son opcionales
     "Delegaciones": ["Delegaciones", "Delegation", "Delegado"],
 }
 
-# --- Columna opcional para objetivo / descripción de la reunión ---
-_OBJETIVO_ALIASES = [
-    "Objetivo","Objetivos","Descripción","Descripcion","Descripción de la mesa",
-    "Descripcion de la mesa","Detalle","Detalle de la mesa","Tema","Asunto"
+# Columnas opcionales candidatas para el "Objetivo"
+OBJECTIVE_ALIASES = [
+    "Objetivo", "Objetivo reunión", "Objetivo de la reunión", "Objetivos",
+    "Descripción", "Descripcion", "Detalle", "Notas", "Observaciones", "Propósito", "Proposito", "Tema", "Asunto"
 ]
-def _find_objetivo_col(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty: return None
-    cols_low = {str(c).lower(): c for c in df.columns}
-    for a in _OBJETIVO_ALIASES:
-        k = a.lower()
-        if k in cols_low: return cols_low[k]
-    return None
+OBJ_COL_NAME: Optional[str] = None  # se detecta después de cargar
 
 # ===== Helpers =====
 def _safe_str(x):
@@ -208,12 +202,20 @@ def find_col(df: pd.DataFrame, canonical: str):
         if a.lower() in cols_low: return cols_low[a.lower()]
     return None
 
+def find_objective_col(df: pd.DataFrame) -> Optional[str]:
+    for a in OBJECTIVE_ALIASES:
+        if a in df.columns: return a
+    low = {str(c).lower(): c for c in df.columns}
+    for a in OBJECTIVE_ALIASES:
+        if a.lower() in low: return low[a.lower()]
+    return None
+
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {}
     for canonical in COLUMN_ALIASES.keys():
         col = find_col(df, canonical)
         if col is None:
-            if canonical == "Delegaciones":  # opcional
+            if canonical in ("Delegaciones",):  # opcionales
                 continue
             st.error(f"Falta la columna requerida: **{canonical}**")
             st.stop()
@@ -500,10 +502,10 @@ def build_ics(rows: pd.DataFrame, calendar_name="Cronograma Mesas POT"):
 # ============= Sidebar =============
 if "dark" not in st.session_state: st.session_state.dark = True
 with st.sidebar:
-    st.session_state.dark = st.checkbox("Modo oscuro", value=st.session_state.dark)
+    st.session_state.dark = st.checkbox("Modo oscuro", value=st.session_state.dark, key="sidebar_dark")
     lite = st.toggle("🪶 Modo ligero (recom.)", value=True,
-                     help="Evita gráficos y cómputos costosos hasta aplicar filtros.")
-    densidad = st.select_slider("Densidad tabla", options=["compacta","media","amplia"], value="compacta")
+                     help="Evita gráficos y cómputos costosos hasta aplicar filtros.", key="sidebar_lite")
+    densidad = st.select_slider("Densidad tabla", options=["compacta","media","amplia"], value="compacta", key="sidebar_density")
     st.markdown("### 📦 Datos")
     st.file_uploader("STREAMLIT.xlsx",    type=["xlsx"], key="upload_main")
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
@@ -516,6 +518,10 @@ st.caption("Modo ligero • Cache por hash • Índices perezosos • Memoria op
 # ============= Carga principal =============
 df0 = _resolve_main_df()
 df0 = clean_delegate_markers(df0)
+
+# Detectar columna de Objetivo (opcional)
+OBJ_COL_NAME = find_objective_col(df0)
+
 df0["_fecha"] = df0["Fecha"].apply(_to_date)
 df0["_ini"]   = df0["Inicio"].apply(_to_time)
 df0["_fin"]   = df0["Fin"].apply(_to_time)
@@ -526,7 +532,7 @@ for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la 
 df0 = _downcast_and_categorize(df0)
 df0 = ensure_sorted(df0)
 
-# Filtro temporal base — solo lun–vie y meses Sep–Oct
+# Filtro temporal base — solo lun–vie y meses Sep–Oct (ajústalo si quieres ampliar)
 def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
 def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
@@ -592,86 +598,7 @@ with sec[0]:
         else:
             st.caption("Se omitieron gráficos pesados por Modo ligero y tamaño de datos.")
 
-    # --- Analítica ligera (on-demand) ---
-    @st.cache_data(show_spinner=False, ttl=1800, max_entries=6)
-    def _mini_analytics(dfu: pd.DataFrame):
-        df = dfu.copy()
-        def _mins(r):
-            if pd.isna(r.get("_ini")) or pd.isna(r.get("_fin")): return np.nan
-            a = datetime.combine(date(2000,1,1), r["_ini"])
-            b = datetime.combine(date(2000,1,1), r["_fin"])
-            return max(0, (b-a).total_seconds()/60.0)
-        df["mins"] = df.apply(_mins, axis=1)
-        daily = df.groupby("_fecha")["Nombre de la mesa"].count().rename("Mesas").reset_index()
-        dur_aula = (df.dropna(subset=["Aula","mins"])
-                      .groupby("Aula")["mins"].mean()
-                      .sort_values(ascending=False).head(10)
-                      .rename("Min. promedio").reset_index())
-        hh = [t.hour for t in df["_ini"] if pd.notna(t)]
-        horas_df = pd.DataFrame({"Hora": hh})
-        occ = (df.dropna(subset=["Aula","_fecha","mins"])
-                 .groupby(["Aula","_fecha"])["mins"].sum()
-                 .reset_index())
-        aula_days = occ.groupby("Aula")["_fecha"].nunique().rename("dias").reset_index()
-        aula_used = occ.groupby("Aula")["mins"].sum().rename("mins_tot").reset_index()
-        occ_join = aula_used.merge(aula_days, on="Aula", how="left")
-        if not occ_join.empty:
-            occ_join["cap_min"] = occ_join["dias"] * 600.0
-            occ_join["Ocupación %"] = np.where(occ_join["cap_min"]>0,
-                                               100.0 * occ_join["mins_tot"] / occ_join["cap_min"], np.nan)
-            ocupacion = (occ_join.sort_values("Ocupación %", ascending=False)
-                                 .head(10)[["Aula","Ocupación %"]])
-        else:
-            ocupacion = pd.DataFrame(columns=["Aula","Ocupación %"])
-        top_resp = (df.dropna(subset=["Responsable"])
-                      .groupby("Responsable")["Nombre de la mesa"].count()
-                      .sort_values(ascending=False).head(10)
-                      .rename("Mesas").reset_index())
-        return {"daily": daily, "dur_aula": dur_aula, "horas_df": horas_df, "ocupacion": ocupacion, "top_resp": top_resp}
-
-    with st.expander("📊 Analítica ligera (clic para calcular)", expanded=False):
-        DFu_local = _dedup_events(DF)  # asegura que usamos la versión deduplicada
-        A = _mini_analytics(DFu_local)
-
-        c1,c2 = st.columns(2)
-        with c1:
-            st.markdown("**Mesas por día**")
-            if not A["daily"].empty:
-                fig = px.line(A["daily"], x="_fecha", y="Mesas", markers=True, height=280)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Sin datos.")
-        with c2:
-            st.markdown("**Horas de inicio (histograma)**")
-            if not A["horas_df"].empty:
-                fig = px.histogram(A["horas_df"], x="Hora", nbins=min(24, A["horas_df"]["Hora"].nunique()), height=280)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Sin horas válidas.")
-        c3,c4 = st.columns(2)
-        with c3:
-            st.markdown("**Duración promedio por aula (Top 10)**")
-            if not A["dur_aula"].empty:
-                fig = px.bar(A["dur_aula"], x="Min. promedio", y="Aula", orientation="h", height=320)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Sin datos de duración.")
-        with c4:
-            st.markdown("**Ocupación aproximada por aula (8–18h) — Top 10**")
-            if not A["ocupacion"].empty:
-                fig = px.bar(A["ocupacion"], x="Ocupación %", y="Aula", orientation="h", height=320)
-                fig.update_xaxes(ticksuffix="%")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No fue posible estimar ocupación.")
-        st.markdown("**Responsables con más mesas (Top 10)**")
-        if not A["top_resp"].empty:
-            fig = px.bar(A["top_resp"], x="Mesas", y="Responsable", orientation="h", height=360)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Sin responsables.")
-
-# ============= Sección: Consulta =============
+# ============= Sección: Consulta (híbrida) =============
 with sec[1]:
     st.subheader("🔎 Consulta filtrada")
     @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
@@ -680,49 +607,41 @@ with sec[1]:
     idx = _get_idx(DF)
 
     # Filtros compactos
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
-    fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
-    if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-    else: today = date.today(); dmin, dmax = today, today
+    c1, c2, c3 = st.columns([1,1,1])
+
+    # --- Entrada híbrida persona (texto o selector) ---
     with c1:
+        # lista de personas desde índice y columnas de DF
+        people = sorted({p for p in set(idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                            + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                            + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()) if p})
+        person_txt = st.text_input("Persona (escribe parcial)", value=_qp_get("q",""), key="consulta_persona_text")
+        person_sel = st.selectbox("…o selecciónala", options=[""] + people, index=0, key="consulta_persona_select")
+        term = person_txt.strip() if person_txt.strip() else (person_sel.strip() if person_sel else "")
+        if st.button("Buscar", use_container_width=True, key="consulta_buscar_btn"):
+            _qp_set({"q": term})
+
+    with c2:
+        fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
+        if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
+        else: today = date.today(); dmin, dmax = today, today
         dr = st.date_input("Rango fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="consulta_rango")
         fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
-        horas = st.slider("Rango horas", 0, 23, (6, 20), key="consulta_horas")
-    with c2:
-        aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-        aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"])
-        dow_opts = ["Lun","Mar","Mié","Jue","Vie"]; dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
-        dow = st.multiselect("Días", dow_opts, default=dow_opts)
-    with c3:
-        responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-        rsel = st.multiselect("Responsables", responsables, default=[])
-    with c4:
-        # Híbrido: texto + selección
-        people = sorted({
-            p for p in set(
-                idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
-                + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
-                + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
-            ) if p
-        })
-        txt = st.text_input("Persona (escribe parcial)", value=_qp_get("q",""))
-        sel = st.selectbox("…o selecciónala", options=[""] + people, index=0)
-        bcols = st.columns([1,1])
-        with bcols[0]:
-            if st.button("Buscar", use_container_width=True):
-                elegido = (txt or sel or "").strip()
-                _qp_set({"q": elegido})
-        with bcols[1]:
-            if st.button("Limpiar", use_container_width=True):
-                _qp_set({"q": ""})
-    term = (_qp_get("q","") or "").strip()
+        hmin, hmax = st.slider("Rango horas", 0, 23, (6, 20), key="consulta_horas")
 
-    # Máscara vectorizada
+    with c3:
+        aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"], key="consulta_aulas")
+        dow_opts = ["Lun","Mar","Mié","Jue","Vie"]; dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
+        dow = st.multiselect("Días", dow_opts, default=dow_opts, key="consulta_dias")
+        responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        rsel = st.multiselect("Responsables", responsables, default=[], key="consulta_responsables")
+
+    # Máscara vectorizada (sin usar columnas inexistentes)
     mask = pd.Series(True, index=idx.index, dtype=bool)
     mask &= idx["_fecha"].between(fmin, fmax, inclusive="both")
     sel_dows = [dows[x] for x in dow] if dow else list(dows.values())
     mask &= idx["_fecha"].map(lambda d: d is not None and d.weekday() in sel_dows)
-    hmin, hmax = st.session_state.get("consulta_horas",(6,20))
     mask &= idx["_ini"].map(lambda t: (t is not None) and (hmin <= t.hour <= hmax))
     if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
         allowed = set([a for a in aula_sel if a != "(todas)"])
@@ -743,7 +662,7 @@ with sec[1]:
     na = res["Aula"].dropna().astype(str).nunique() if not res.empty else 0
     nd = res["_fecha"].dropna().nunique() if not res.empty else 0
     allp = []
-    for v in res["Participantes"].fillna("").astype(str).tolist(): allp += _split_people(v)
+    for v in res.get("Participantes", pd.Series(dtype=str)).fillna("").astype(str).tolist(): allp += _split_people(v)
     npersonas = len(pd.unique(pd.Series([p.strip() for p in allp if p]).astype(str))) if not res.empty else 0
     d1,d2,d3,d4 = st.columns(4)
     with d1: st.markdown(f"<div class='card'><div class='kpi'>Mesas</div><span class='value'>{tm}</span></div>", unsafe_allow_html=True)
@@ -767,103 +686,69 @@ with sec[1]:
 
         st.markdown("##### ⬇️ Descargas")
         st.download_button("CSV (filtro)", data=rf.to_csv(index=False).encode("utf-8-sig"),
-                           mime="text/csv", file_name="resultados.csv")
+                           mime="text/csv", file_name="resultados.csv", key="consulta_dl_csv")
         xls_buf = io.BytesIO()
         with pd.ExcelWriter(xls_buf, engine="xlsxwriter") as w:
             rf.to_excel(w, sheet_name="Resultados", index=False)
         st.download_button("Excel (filtro)", data=xls_buf.getvalue(),
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           file_name="resultados.xlsx")
+                           file_name="resultados.xlsx", key="consulta_dl_xlsx")
         st.download_button("ICS (todo en uno)", data=build_ics(res, calendar_name="Cronograma Mesas POT"),
-                           mime="text/calendar", file_name="mesas.ics")
+                           mime="text/calendar", file_name="mesas.ics", key="consulta_dl_ics")
 
-# ============= Sección: Agenda =============
+# ============= Sección: Agenda (híbrida + objetivo) =============
 with sec[2]:
     st.subheader("🗓️ Agenda por persona")
-
     @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
     def _get_idx(df: pd.DataFrame) -> pd.DataFrame:
         return build_index_cached(df)
-
     idx = _get_idx(DF)
 
-    # Híbrido: texto + seleccionable
-    people = sorted({
-        p for p in set(
-            idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
-            + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
-            + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
-        ) if p
-    })
+    people = sorted({p for p in set(idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                        + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                        + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()) if p})
+    person_txt = st.text_input("Persona (escribe parcial)", value="", key="agenda_persona_text")
+    person_sel = st.selectbox("…o selecciónala", options=[""] + people, index=0, key="agenda_persona_select")
+    persona = person_txt.strip() if person_txt.strip() else (person_sel.strip() if person_sel else "")
 
-    c1, c2 = st.columns([2,1])
-    with c1:
-        person_txt = st.text_input("Persona (escribe parcial)", value="")
-    with c2:
-        person_sel = st.selectbox("…o selecciónala", options=[""] + people, index=0)
-
-    persona = (person_txt or person_sel).strip()
-
-    if not persona:
-        st.info("Escribe o selecciona una persona para ver su agenda.")
-    else:
-        term_norm = _norm(persona)
-        is_exact = (person_txt.strip() == "") and (person_sel.strip() != "")
-
-        if is_exact:
-            m = (
-                (idx["__norm_part"] == term_norm) |
-                (idx["__norm_Responsable"] == term_norm) |
-                (idx["__norm_Corresponsable"] == term_norm)
-            )
-        else:
-            m = (
-                fuzzy_filter(idx["__norm_part"], persona, 0.9) |
-                fuzzy_filter(idx["__norm_Responsable"], persona, 0.9) |
-                fuzzy_filter(idx["__norm_Corresponsable"], persona, 0.9)
-            )
-
+    if persona:
+        m = (fuzzy_filter(idx["__norm_part"], persona, 0.9) |
+             fuzzy_filter(idx["__norm_Responsable"], persona, 0.9) |
+             fuzzy_filter(idx["__norm_Corresponsable"], persona, 0.9))
         cols_ag     = ["_fecha","_ini","_fin","Aula","Nombre de la mesa","Responsable","Corresponsable","Participantes"]
-        use_cols_ag = [c for c in cols_ag if c in idx.columns]
-        rows        = _dedup_events(idx.loc[m, use_cols_ag].copy())
+        # si existe columna de objetivo, la añadimos
+        if OBJ_COL_NAME and OBJ_COL_NAME in DF.columns:
+            cols_ag = cols_ag + [OBJ_COL_NAME]
+        use_cols_ag = _select_existing(idx.join(DF[[c for c in [OBJ_COL_NAME] if c and c in DF.columns]], how="left"), cols_ag)
+        rows        = _dedup_events(idx.loc[m, _select_existing(idx, cols_ag)].copy())
+
+        # merge objetivo si aplica
+        if OBJ_COL_NAME and OBJ_COL_NAME in DF.columns and not rows.empty:
+            # clave para unir: fecha+inicio+fin+aula+nombre de mesa
+            KEY = ["_fecha","_ini","_fin","Aula","Nombre de la mesa"]
+            rows = rows.merge(
+                DF[KEY + [OBJ_COL_NAME]],
+                on=_select_existing(rows, KEY), how="left"
+            )
+
         rows = ensure_sorted(rows)
-
         if rows.empty:
-            st.warning("Sin eventos para esta persona en el rango cargado.")
+            st.info("Sin eventos para esta persona.")
         else:
-            objetivo_col = _find_objetivo_col(DF)
-
             for _, r in rows.iterrows():
                 s_ini = r["_ini"].strftime('%H:%M') if r["_ini"] else ""
                 s_fin = r["_fin"].strftime('%H:%M') if r["_fin"] else ""
-                titulo = _safe_str(r.get("Nombre de la mesa"))
-
-                st.markdown(f"**{titulo}**")
                 st.markdown(
-                    f"{r['_fecha'].isoformat() if r['_fecha'] else ''} • {s_ini}–{s_fin} • Aula: {_safe_str(r.get('Aula',''))}"
+                    f"**{_safe_str(r['Nombre de la mesa'])}**  \n"
+                    f"{r['_fecha'].isoformat() if r['_fecha'] else ''} • {s_ini}–{s_fin} • Aula: {_safe_str(r['Aula'])}",
+                    unsafe_allow_html=True
                 )
-
-                # Mostrar Objetivo si existe en DF (match por fecha + nombre + aula cuando esté)
-                if objetivo_col:
-                    try:
-                        mm = ((DF["_fecha"] == r["_fecha"]) &
-                              (DF["Nombre de la mesa"].astype(str) == r.get("Nombre de la mesa")))
-                        if "Aula" in DF.columns and pd.notna(r.get("Aula")):
-                            mm = mm & (DF["Aula"].astype(str) == str(r.get("Aula")))
-                        obj_txt = _safe_str(DF.loc[mm, objetivo_col].iloc[0]) if mm.any() else ""
-                        if obj_txt:
-                            st.caption(obj_txt)
-                    except Exception:
-                        pass
-
+                if OBJ_COL_NAME and OBJ_COL_NAME in r and _safe_str(r[OBJ_COL_NAME]):
+                    st.markdown(f"*Objetivo:* {r[OBJ_COL_NAME]}")
                 st.divider()
-
-            st.download_button(
-                "⬇️ ICS (Agenda)",
+            st.download_button("⬇️ ICS (Agenda)",
                 data=build_ics(rows, calendar_name=f"Agenda — {persona}"),
-                mime="text/calendar",
-                file_name=f"agenda_{persona}.ics"
-            )
+                mime="text/calendar", file_name=f"agenda_{persona}.ics", key="agenda_dl_ics")
 
 # ============= Sección: Gantt =============
 with sec[3]:
@@ -907,7 +792,7 @@ with sec[4]:
                 fig.update_layout(height=500, margin=dict(l=6,r=6,t=28,b=14))
                 st.plotly_chart(fig, use_container_width=True)
 
-# ============= Sección: Delegaciones =============
+# ============= Sección: Delegaciones (con filtros) =============
 with sec[5]:
     st.subheader("🛟 Delegaciones")
     deleg_raw = _resolve_deleg_df()
@@ -921,7 +806,7 @@ with sec[5]:
             if out is not None:
                 out["Deben delegar"] = [[] for _ in range(len(out))]
             return out
-        ev = df_events[["_fecha","_ini","_fin","Nombre de la mesa","Mesa"]].copy()
+        ev = df_events[["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Aula","Responsable","Corresponsable","Participantes"]].copy()
         ev["mesa_norm"]  = ev["Mesa"].fillna(ev["Nombre de la mesa"]).astype(str).map(_norm_mesa_code)
         merged = ev.merge(deleg_map, left_on=["mesa_norm","_fecha"], right_on=["__mesa","__fecha"], how="left")
         if merged.empty:
@@ -947,78 +832,57 @@ with sec[5]:
     rep = _actors_for_event_batch(DFu, deleg_map) if not deleg_map.empty else pd.DataFrame()
     rep = rep[rep["Deben delegar"].map(len)>0] if not rep.empty else rep
 
+    # ---- Filtros de Delegaciones ----
+    c1, c2, c3 = st.columns([1,1,1])
+    if not rep.empty:
+        fechas_validas = [d for d in rep["_fecha"].dropna().tolist()]
+        if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
+        else: today = date.today(); dmin, dmax = today, today
+        with c1:
+            dr = st.date_input("Rango fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="deleg_rango")
+            fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
+        with c2:
+            aulas = sorted(rep.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"], key="deleg_aulas")
+        with c3:
+            # actores posibles
+            actores = sorted(pd.unique(sum(rep["Deben delegar"].tolist(), [])))
+            act_txt = st.text_input("Actor (texto)", key="deleg_actor_text")
+            act_sel = st.selectbox("…o selecciónalo", options=[""] + actores, index=0, key="deleg_actor_select")
+            actor_term = act_txt.strip() if act_txt.strip() else (act_sel.strip() if act_sel else "")
+
+        # aplicar filtros
+        m = (rep["_fecha"].between(fmin, fmax, inclusive="both"))
+        if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
+            allowed = set([a for a in aula_sel if a != "(todas)"])
+            m &= rep["Aula"].astype(str).isin(allowed)
+        if actor_term:
+            m &= rep["Deben delegar"].map(lambda lst: any(_norm(actor_term) in _norm(x) for x in lst))
+
+        rep = rep.loc[m].copy()
+
     if rep.empty:
         st.info("No hay delegaciones registradas para las mesas/fechas cargadas.")
     else:
-        # Normaliza columnas visibles y prepara filtros ligeros
         rep["Fecha"]  = rep["_fecha"].map(lambda d: d.isoformat() if d else "")
         rep["Inicio"] = rep["_ini"].map(lambda t: t.strftime("%H:%M") if t else "")
         rep["Fin"]    = rep["_fin"].map(lambda t: t.strftime("%H:%M") if t else "")
         rep["Deben delegar"] = rep["Deben delegar"].map(lambda lst: ", ".join(lst))
-
-        # --- Filtros ---
-        st.markdown("### 🔎 Filtros")
-        f1,f2,f3,f4 = st.columns([1,1,1,1])
-
-        fechas_validas = [d for d in rep["_fecha"].dropna().tolist()]
-        if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-        else: today = date.today(); dmin, dmax = today, today
-
-        with f1:
-            dr = st.date_input("Rango de fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="deleg_rng")
-            fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
-        with f2:
-            actores = sorted(pd.unique(", ".join(rep["Deben delegar"]).split(", "))) if not rep["Deben delegar"].empty else []
-            act_txt = st.text_input("Actor (texto)")
-            act_sel = st.selectbox("…o selecciónalo", options=[""] + actores, index=0)
-            actor_term = (act_txt or act_sel).strip()
-        with f3:
-            aulas = sorted(rep.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-            aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"])
-        with f4:
-            q = st.text_input("Texto libre (mesa/resp/corresp/part)")
-
-        # --- Aplicación de filtros ---
-        mask = pd.Series(True, index=rep.index, dtype=bool)
-        mask &= rep["_fecha"].between(fmin, fmax, inclusive="both")
-
-        if actor_term:
-            at = _norm(actor_term)
-            mask &= rep["Deben delegar"].astype(str).map(lambda s: at in _norm(s))
-
-        if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
-            allowed = set([a for a in aula_sel if a != "(todas)"])
-            mask &= rep["Aula"].astype(str).isin(allowed)
-
-        if q:
-            qn = _norm(q)
-            campos = (
-                rep["Nombre de la mesa"].astype(str) + " " +
-                rep.get("Responsable","").astype(str) + " " +
-                rep.get("Corresponsable","").astype(str) + " " +
-                rep.get("Participantes","").astype(str)
-            )
-            mask &= campos.map(lambda s: qn in _norm(s))
-
-        rep_view = rep.loc[mask].copy()
-
-        st.markdown("### 📋 Delegaciones")
         view_cols = ["Nombre de la mesa","Fecha","Inicio","Fin","Aula","Responsable","Corresponsable","Participantes","Deben delegar"]
-        view_cols = [c for c in view_cols if c in rep_view.columns]
-        view = rep_view[view_cols].head(MAX_ROWS)
-        if rep_view.shape[0] > MAX_ROWS:
-            st.caption(f"Mostrando {MAX_ROWS} de {rep_view.shape[0]} filas.")
+        view = rep[view_cols].head(MAX_ROWS)
+        if rep.shape[0] > MAX_ROWS:
+            st.caption(f"Mostrando {MAX_ROWS} de {rep.shape[0]} filas.")
         st.dataframe(view, use_container_width=True, hide_index=True)
-
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            rep_view[view_cols].to_excel(w, sheet_name="Delegaciones", index=False)
+            rep[view_cols].to_excel(w, sheet_name="Delegaciones", index=False)
         st.download_button("⬇️ Delegaciones (Excel)", data=buf.getvalue(),
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           file_name="delegaciones_filtrado.xlsx")
+                           file_name="delegaciones.xlsx", key="deleg_dl_xlsx")
 
 # ===== Housekeeping opcional (liberar memoria) =====
-if st.sidebar.button("🧹 Limpiar cachés"):
-    st.cache_data.clear()
-    gc.collect()
-    st.sidebar.success("Cachés limpiadas y GC ejecutado.")
+with st.sidebar:
+    if st.button("🧹 Limpiar cachés", key="sidebar_clear_cache"):
+        st.cache_data.clear()
+        gc.collect()
+        st.success("Cachés limpiadas y GC ejecutado.")
