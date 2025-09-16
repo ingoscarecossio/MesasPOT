@@ -178,7 +178,7 @@ def _to_date(x):
     if not s: return None
     s2 = s.replace(".", "-").replace("/", "-")
 
-    # Preferencia del usuario: AAAA-DD-MM (año–día–mes)
+    # Preferencia: AAAA–DD–MM
     m = _DATE_YDM.match(s2)
     if m:
         y, a, b = map(int, m.groups())
@@ -187,7 +187,7 @@ def _to_date(x):
         if 1 <= mo <= 12 and 1 <= d <= 31:
             try: return date(y, mo, d)
             except ValueError: pass
-        # Intento 2: Y-M-D (fallback si lo anterior no es válido)
+        # Intento 2: Y-M-D (fallback)
         mo, d = a, b
         if 1 <= mo <= 12 and 1 <= d <= 31:
             try: return date(y, mo, d)
@@ -198,16 +198,15 @@ def _to_date(x):
     if m2:
         d, mo, y = m2.groups()
         d, mo, y = int(d), int(mo), int(y)
-        if y < 100: y += 2000  # por si viene a dos dígitos
+        if y < 100: y += 2000
         if 1 <= mo <= 12 and 1 <= d <= 31:
             try: return date(y, mo, d)
             except ValueError: pass
 
-    # Último recurso: pandas (permite strings locales)
+    # Último recurso: pandas
     dt = pd.to_datetime(s, errors="coerce", dayfirst=False, yearfirst=True)
     if not pd.isna(dt):
         if isinstance(dt, pd.Timestamp): return dt.date()
-    # Nada funcionó
     return None
 
 def _to_time(x):
@@ -221,7 +220,7 @@ def _to_time(x):
         if not s: return None
         hh, mm = s.split(":")[:2]
         return time(int(hh), int(mm))
-    except Exception: 
+    except Exception:
         return None
 
 def combine_dt(fecha, hora, tz: Optional[timezone]=None):
@@ -266,7 +265,7 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 # ===== Carga de Excel (cache por hash con TTL) =====
 def _file_hash(file_obj_or_path) -> str:
     h = hashlib.sha1()
-    if hasattr(file_obj_or_path, "read"):  # UploadedFile
+    if hasattr(file_obj_or_path, "read"):
         pos = file_obj_or_path.tell(); file_obj_or_path.seek(0)
         h.update(file_obj_or_path.read()); file_obj_or_path.seek(pos)
     else:
@@ -355,7 +354,6 @@ def _downcast_and_categorize(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             try: df[col] = df[col].astype("category")
             except Exception: pass
-    # enteros → int32 / floats → float32 (no cast de float a int)
     for col in df.select_dtypes(include=["int64","Int64"]).columns:
         try: df[col] = pd.to_numeric(df[col], downcast="integer")
         except Exception: pass
@@ -527,7 +525,7 @@ with st.sidebar:
     st.markdown("### 📦 Datos")
     st.file_uploader("STREAMLIT.xlsx",    type=["xlsx"], key="upload_main")
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
-    only_weekdays = st.checkbox("Solo Lun–Vie (global)", value=True, key="filt_habiles")
+    only_weekdays = st.checkbox("Solo Lun–Vie (global)", value=False, key="filt_habiles")  # ← por defecto desactivado
     if st.button("🧹 Limpiar cachés", key="house_gc_btn"):
         st.cache_data.clear()
         gc.collect()
@@ -706,17 +704,21 @@ with sec[1]:
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
-    else: 
+    else:
         today = date.today(); dmin, dmax = today, today
     with c1:
-        dr = st.date_input("Rango fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="consulta_rango")
+        # SIN min_value/max_value → no bloquea fechas anteriores a hoy
+        dr = st.date_input("Rango fechas", value=(dmin, dmax), key="consulta_rango")
         fmin, fmax = (dr if isinstance(dr, tuple) and len(dr)==2 else (dmin, dmax))
         st.slider("Rango horas", 0, 23, (6, 20), key="consulta_horas")
     with c2:
         aulas = sorted(DF.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         aula_sel = st.multiselect("Aulas", ["(todas)"] + aulas, default=["(todas)"], key="cons_aulas")
-        dow_opts = ["Lun","Mar","Mié","Jue","Vie"]; dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
-        dow = st.multiselect("Días", dow_opts, default=dow_opts if st.session_state.get("filt_habiles", True) else dow_opts, key="cons_dow")
+        # Días (incluye fin de semana; por defecto depende del toggle global)
+        dow_opts = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+        dow_map = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4,"Sáb":5,"Dom":6}
+        default_dow = (dow_opts[:5] if st.session_state.get("filt_habiles", False) else dow_opts)
+        dow = st.multiselect("Días", dow_opts, default=default_dow, key="cons_dow")
     with c3:
         responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         rsel = st.multiselect("Responsables", responsables, default=[], key="cons_resp")
@@ -739,8 +741,7 @@ with sec[1]:
     # Máscara vectorizada
     mask = pd.Series(True, index=idx.index, dtype=bool)
     mask &= idx["_fecha"].between(fmin, fmax, inclusive="both")
-    dows = {"Lun":0,"Mar":1,"Mié":2,"Jue":3,"Vie":4}
-    sel_dows = [dows[x] for x in dow] if dow else list(dows.values())
+    sel_dows = [dow_map[x] for x in dow] if dow else list(dow_map.values())
     mask &= idx["_fecha"].map(lambda d: d is not None and d.weekday() in sel_dows)
     hmin, hmax = st.session_state.get("consulta_horas",(6,20))
     mask &= idx["_ini"].map(lambda t: (t is not None) and (hmin <= t.hour <= hmax))
@@ -947,7 +948,8 @@ with sec[5]:
         else:
             today = date.today(); dmin, dmax = today, today
         with c1:
-            rango = st.date_input("Rango fechas", value=(dmin, dmax), min_value=dmin, max_value=dmax, key="del_rango")
+            # SIN min_value/max_value → no bloquea fechas pasadas
+            rango = st.date_input("Rango fechas", value=(dmin, dmax), key="del_rango")
             fmin, fmax = (rango if isinstance(rango, tuple) and len(rango) == 2 else (dmin, dmax))
         with c2:
             aulas = sorted(rep.get("Aula", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
