@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Cronograma Mesas POT — LIGHT+ (memoria reducida + meses/años + omnibox)
+Cronograma Mesas POT — LIGHT (memoria reducida)
 Secciones: Resumen, Consulta, Agenda, Gantt, Heatmap, Delegaciones
-Optimiza RAM:
 - Cache por hash con TTL + max_entries
-- Índices/normalizaciones perezosos (sobre subset por Año/Mes/Días)
+- Índices/normalizaciones perezosos
 - Downcast + category
-- Modo ligero para datasets grandes (omite gráficos costosos)
-- Límite de filas renderizadas (exportes completos)
-- Arreglo KeyError por columnas inexistentes en idx
+- Modo ligero para datasets grandes (evita gráficos costosos)
+- Límite de filas renderizadas en tablas (exportes completos aparte)
 """
 
 import io, re, base64, unicodedata, difflib, os, json, hashlib, glob, sys, gc
@@ -21,10 +19,10 @@ import plotly.express as px
 import streamlit as st
 
 # ============= Config básica y apariencia =============
-st.set_page_config(page_title="Cronograma Mesas POT — Light+", page_icon="🗂️",
+st.set_page_config(page_title="Cronograma Mesas POT — Light", page_icon="🗂️",
                    layout="wide", initial_sidebar_state="expanded")
 
-def inject_base_css(dark: bool = True, density: str = "compacta"):
+def inject_base_css(dark: bool = True, shade: float = 0.75, density: str = "compacta"):
     row_pad = {"compacta":"0.25rem","media":"0.5rem","amplia":"0.8rem"}.get(density,"0.5rem")
     st.markdown(f"""
     <style>
@@ -69,11 +67,6 @@ COLUMN_ALIASES = {
     "Responsable": ["Responsable"],
     "Corresponsable": ["Corresponsable", "Co-responsable", "Co Responsable"],
     "Delegaciones": ["Delegaciones", "Delegation", "Delegado"],
-}
-
-MESES_ES = {
-    1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
-    7:"Julio",8:"Agosto",9:"Septiembre",10:"Octubre",11:"Noviembre",12:"Diciembre"
 }
 
 # ===== Helpers =====
@@ -239,6 +232,7 @@ def load_excel_from_src(src_key: str, bytes_data: bytes | None, sheet_candidates
     except Exception as e:
         st.error(f"❌ Error abriendo Excel: {e}"); st.stop()
 
+    # Selección de hoja (primera válida o primera del libro)
     try:
         if sheet_candidates:
             for cand in sheet_candidates:
@@ -299,7 +293,7 @@ def clean_delegate_markers(df: pd.DataFrame) -> pd.DataFrame:
 def _downcast_and_categorize(df: pd.DataFrame) -> pd.DataFrame:
     """Ajuste de memoria: category en textos repetidos y downcast numérico."""
     df = df.copy()
-    for col in ["Aula","Responsable","Corresponsable","Nombre de la mesa","Mesa"]:
+    for col in ["Aula","Responsable","Corresponsable"]:
         if col in df.columns:
             try: df[col] = df[col].astype("category")
             except Exception: pass
@@ -317,13 +311,14 @@ def _dedup_events(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         return df.copy()
 
-# ===== Índice perezoso por persona (sobre DF filtrado por Año/Mes/Día) =====
+# ===== Índice perezoso por persona =====
 @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
 def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     use_cols = _select_existing(df, ["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participantes","Responsable","Corresponsable","Aula"])
     it = df[use_cols].itertuples(index=False, name=None)
     for tup in it:
+        # mapeo por posición (según use_cols)
         rec = dict(zip(use_cols, tup))
         part_list = _split_people(rec.get("Participantes"))
         extra = []
@@ -340,11 +335,12 @@ def build_index_cached(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows, columns=["_fecha","_ini","_fin","Nombre de la mesa","Mesa","Participantes","Responsable","Corresponsable","Aula","Participante_individual"])
     out = ensure_sorted(out)
     for col in ["Responsable","Corresponsable","Aula","Nombre de la mesa","Participantes","Mesa"]:
-        if col in out.columns: out[f"__norm_{col}"] = out[col].astype(str).map(_norm)
+        if col in out.columns: out[f"__norm_{col}"] = out[col].fillna("").astype(str).map(_norm)
     if "Participante_individual" in out.columns:
         out["__norm_part"] = out["Participante_individual"].fillna("").astype(str).map(_norm)
     else:
         out["__norm_part"] = ""
+    # categorías para ahorrar memoria
     for col in ["Aula","Responsable","Corresponsable","Nombre de la mesa","Participante_individual"]:
         if col in out.columns:
             try: out[col] = out[col].astype("category")
@@ -387,7 +383,7 @@ def _prepare_deleg_map(df: pd.DataFrame) -> pd.DataFrame:
         "__ini":       df[col_ini].map(_to_t) if (col_ini is not None and col_ini in df.columns) else None,
         "__fin":       df[col_fin].map(_to_t) if (col_fin is not None and col_fin in df.columns) else None
     }).dropna(subset=["__mesa","__fecha"])
-    def t2m(t):
+    def t2m(t): 
         if pd.isna(t) or t is None: return np.nan
         return int(t.hour)*60 + int(t.minute)
     out["__ini_m"] = out["__ini"].map(t2m) if "__ini" in out.columns else np.nan
@@ -498,10 +494,10 @@ with st.sidebar:
     st.file_uploader("STREAMLIT.xlsx",    type=["xlsx"], key="upload_main")
     st.file_uploader("DELEGACIONES.xlsx", type=["xlsx"], key="upload_deleg")
 
-inject_base_css(st.session_state.dark, densidad)
+inject_base_css(st.session_state.dark, 0.75, densidad)
 
-st.markdown("<h1 class='gradient-title'>🗂️ Cronograma Mesas POT — Light+</h1>", unsafe_allow_html=True)
-st.caption("Modo ligero • Cache por hash • Índices perezosos (Año/Mes) • Memoria optimizada")
+st.markdown("<h1 class='gradient-title'>🗂️ Cronograma Mesas POT — Light</h1>", unsafe_allow_html=True)
+st.caption("Modo ligero • Cache por hash • Índices perezosos • Memoria optimizada")
 
 # ============= Carga principal =============
 df0 = _resolve_main_df()
@@ -516,35 +512,15 @@ for col in ["Participantes","Responsable","Corresponsable","Aula","Nombre de la 
 df0 = _downcast_and_categorize(df0)
 df0 = ensure_sorted(df0)
 
-# ========= Filtros globales (Año / Mes / Días hábiles) =========
-years_avail = sorted({d.year for d in df0["_fecha"].dropna()})
-months_avail = sorted({d.month for d in df0["_fecha"].dropna()})
-with st.expander("⚙️ Filtros globales (aplican a todas las secciones)"):
-    c1,c2,c3 = st.columns([1,1,1])
-    with c1:
-        years_sel = st.multiselect("Año(s)", options=years_avail, default=years_avail)
-    with c2:
-        meses_opts = [MESES_ES[m] for m in months_avail]
-        meses_sel_nombres = st.multiselect("Mes(es)", options=meses_opts, default=meses_opts)
-        meses_sel = [k for k,v in MESES_ES.items() if v in meses_sel_nombres]
-    with c3:
-        solo_habiles = st.checkbox("Solo días hábiles (Lun–Vie)", value=True)
-
+# Filtro temporal base — solo lun–vie y meses Sep–Oct (ajústalo si quieres ampliar)
 def _is_weekday(d: Optional[date]) -> bool:
     return (d is not None) and (0 <= d.weekday() <= 4)
-
-mask_global = pd.Series(True, index=df0.index, dtype=bool)
-if years_sel:
-    mask_global &= df0["_fecha"].map(lambda d: (d is not None) and (d.year in years_sel))
-if meses_sel:
-    mask_global &= df0["_fecha"].map(lambda d: (d is not None) and (d.month in meses_sel))
-if solo_habiles:
-    mask_global &= df0["_fecha"].map(_is_weekday)
-
-DF = df0[mask_global].copy()
+def _only_sep_oct_weekdays(d: Optional[date]) -> bool:
+    return _is_weekday(d) and (d.month in (9,10))
+DF = df0[df0["_fecha"].map(_only_sep_oct_weekdays)].copy()
 
 if DF.empty:
-    st.warning("No hay filas para los filtros globales aplicados. Ajusta Año/Mes o desmarca 'Solo hábiles'.")
+    st.warning("No hay filas válidas (Lun–Vie, Sep–Oct). Sube un Excel o ajusta el filtro temporal desde el archivo fuente.")
 
 # Secciones disponibles
 sections = ["Resumen","Consulta","Agenda","Gantt","Heatmap","Delegaciones"]
@@ -555,7 +531,7 @@ with sec[0]:
     st.subheader("📈 Resumen ejecutivo")
     DFu = _dedup_events(DF)
     if lite and DFu.shape[0] > 6000:
-        st.info("Modo ligero activo: desactívalo o filtra para ver gráficos.")
+        st.info("Modo ligero activo: desactívalo o filtra en Consulta para ver gráficos.")
     else:
         def make_stats(df):
             base = _dedup_events(df)
@@ -575,6 +551,7 @@ with sec[0]:
         with c3: st.markdown(f"<div class='card'><div class='kpi'>Días</div><span class='value'>{nd}</span></div>", unsafe_allow_html=True)
         with c4: st.markdown(f"<div class='card'><div class='kpi'>Personas únicas</div><span class='value'>{npers}</span></div>", unsafe_allow_html=True)
 
+        # Top personas y aulas (compacto)
         if DFu.shape[0] <= 20000 or not lite:
             all_people = []
             for v in DFu["Participantes"].fillna("").astype(str).tolist():
@@ -601,7 +578,7 @@ with sec[0]:
         else:
             st.caption("Se omitieron gráficos pesados por Modo ligero y tamaño de datos.")
 
-# ============= Sección: Consulta (con OMNIBOX de persona) =============
+# ============= Sección: Consulta =============
 with sec[1]:
     st.subheader("🔎 Consulta filtrada")
     @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
@@ -609,14 +586,7 @@ with sec[1]:
         return build_index_cached(df)
     idx = _get_idx(DF)
 
-    # Omnibox persona + filtros compactos
-    col_omni, col_btn = st.columns([1,0.18])
-    with col_omni:
-        term = st.text_input("👤 Buscar persona (nombre parcial, responsable o corresponsable)", value=_qp_get("q",""))
-    with col_btn:
-        if st.button("Buscar", use_container_width=True):
-            _qp_set({"q":term})
-
+    # Filtros compactos
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     fechas_validas = [d for d in DF["_fecha"].dropna().tolist()]
     if fechas_validas: dmin, dmax = min(fechas_validas), max(fechas_validas)
@@ -634,20 +604,21 @@ with sec[1]:
         responsables = sorted(DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         rsel = st.multiselect("Responsables", responsables, default=[])
     with c4:
-        solo_con_part = st.checkbox("Solo filas con Participantes no vacíos", value=False)
+        term = st.text_input("Persona (texto)", value=_qp_get("q",""))
+        if st.button("Buscar", use_container_width=True):
+            _qp_set({"q":term})
 
-    # Máscara vectorizada
+    # Máscara vectorizada (sin usar columnas inexistentes)
     mask = pd.Series(True, index=idx.index, dtype=bool)
     mask &= idx["_fecha"].between(fmin, fmax, inclusive="both")
     sel_dows = [dows[x] for x in dow] if dow else list(dows.values())
-    hmin, hmax = st.session_state.get("consulta_horas",(6,20))
     mask &= idx["_fecha"].map(lambda d: d is not None and d.weekday() in sel_dows)
+    hmin, hmax = st.session_state.get("consulta_horas",(6,20))
     mask &= idx["_ini"].map(lambda t: (t is not None) and (hmin <= t.hour <= hmax))
     if aula_sel and not (len(aula_sel)==1 and aula_sel[0]=="(todas)"):
         allowed = set([a for a in aula_sel if a != "(todas)"])
         mask &= idx["Aula"].astype(str).isin(allowed)
     if rsel: mask &= idx["Responsable"].astype(str).isin(set(rsel))
-    if solo_con_part: mask &= idx["Participante_individual"].astype(str).str.len() > 0
     if term:
         mask &= (fuzzy_filter(idx["__norm_part"], term) |
                  fuzzy_filter(idx["__norm_Responsable"], term) |
@@ -705,7 +676,6 @@ with sec[2]:
         return build_index_cached(df)
     idx = _get_idx(DF)
 
-    # Lista se construye sobre DF filtrado globalmente (menos RAM)
     people = sorted({p for p in set(idx.get("Participante_individual", pd.Series(dtype=str)).dropna().astype(str).tolist()
                         + DF.get("Responsable", pd.Series(dtype=str)).dropna().astype(str).tolist()
                         + DF.get("Corresponsable", pd.Series(dtype=str)).dropna().astype(str).tolist()) if p})
@@ -736,10 +706,10 @@ with sec[2]:
 
 # ============= Sección: Gantt =============
 with sec[3]:
-    st.subheader("📊 Gantt")
+    st.subheader("📊 Gantt (Lun–Vie Sep–Oct)")
     DFu = _dedup_events(DF)
     if lite and DFu.shape[0] > 6000:
-        st.info("Modo ligero activo: desactívalo o filtra para ver el Gantt.")
+        st.info("Modo ligero activo: desactívalo o filtra en Consulta para ver el Gantt.")
     else:
         rows = []
         for _, r in DFu.iterrows():
@@ -760,7 +730,7 @@ with sec[4]:
     st.subheader("🗺️ Heatmap (Aula × Día)")
     DFu = _dedup_events(DF)
     if lite and DFu.shape[0] > 6000:
-        st.info("Modo ligero activo: desactívalo o filtra para ver el heatmap.")
+        st.info("Modo ligero activo: desactívalo o filtra en Consulta para ver el heatmap.")
     else:
         if "Aula" not in DFu.columns or "_fecha" not in DFu.columns:
             st.info("Faltan columnas para el heatmap.")
@@ -817,7 +787,7 @@ with sec[5]:
     rep = rep[rep["Deben delegar"].map(len)>0] if not rep.empty else rep
 
     if rep.empty:
-        st.info("No hay delegaciones registradas para los filtros globales.")
+        st.info("No hay delegaciones registradas para las mesas/fechas cargadas.")
     else:
         rep["Fecha"]  = rep["_fecha"].map(lambda d: d.isoformat() if d else "")
         rep["Inicio"] = rep["_ini"].map(lambda t: t.strftime("%H:%M") if t else "")
